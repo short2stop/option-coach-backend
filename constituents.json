@@ -1,0 +1,51 @@
+{
+  "sp500": [
+    "AAPL","MSFT","AMZN","NVDA","GOOGL","META","TSLA","BRK.B","UNH","JNJ",
+    "JPM","V","XOM","PG","MA","HD","LLY","CVX","ABBV","PEP",
+    "MRK","AVGO","KO","COST","MCD","CSCO","TMO","BAC","ADBE","WMT",
+    "ACN","DHR","PFE","LIN","DIS","NFLX","INTC","VZ","ABT","CRM",
+    "TXN","AMD","NKE","NEE","PM","HON","ORCL","AMGN","AMT","CAT",
+    "NOW","QCOM","SBUX","LOW","IBM","RTX","GE","MDT","GS","ISRG",
+    "BLK","DE","SCHW","CVS","PLD","AXP","C","LMT","ADP","SPGI",
+    "SYK","BKNG","BDX","REGN","MS","MU","GILD","ELV","USB","T",
+    "VRTX","TGT","ZTS","MMC","CI","PNC","MO","PGR","MMM","SO",
+    "ADI","CME","CB","DUK","COP","EQIX","CSX","KLAC","ICE","NSC",
+    "HUM","FISV","FCX","CHTR","EOG","MDLZ","MCO","SLB","MPC","ETN",
+    "GM","APH","ITW","PSA","NOC","ECL","AON","AEP","ROP","LRCX",
+    "ORLY","F","APD","SNPS","NEM","MAR","NXPI","TDG","HCA","PH",
+    "SHW","AIG","TT","AFL","GD","HES","MSI","VLO","WMB","PAYX",
+    "CDNS","MCK","FTNT","A","KMI","D","PCAR","CMI","OXY","SRE",
+    "EW","CNC","ALL","LUV","KMB","COF","AZO","PSX","YUM","VICI",
+    "BIIB","ANET","ROST","TRV","CTAS","ADSK","HPQ","CARR","PSA","CMCSA",
+    "WELL","DLR","OKE","HIG","IQV","CTSH","PPG","EXC","SPG","STZ",
+    "VRSK","EMR","PEG","MTD","AME","GWW","BK","EBAY","WEC","ROK"
+  ],
+
+  "dow30": [
+    "AAPL","AMGN","AXP","BA","CAT","CRM","CSCO","CVX","DIS","GS",
+    "HD","HON","IBM","INTC","JNJ","JPM","KO","MCD","MMM","MRK",
+    "MSFT","NKE","PG","TRV","UNH","V","VZ","WBA","WMT","DOW"
+  ],
+
+  "nasdaq100": [
+    "AAPL","MSFT","AMZN","NVDA","META","GOOGL","GOOG","TSLA","PEP","COST",
+    "AVGO","CSCO","ADBE","TXN","NFLX","AMD","INTC","QCOM","PYPL","AMGN",
+    "HON","SBUX","MDLZ","INTU","GILD","BKNG","CHTR","VRTX","LRCX","ADP",
+    "CSX","MRNA","MAR","PDD","ISRG","KLAC","ABNB","PANW","REGN","TEAM",
+    "ORLY","ADI","KDP","SNPS","MELI","CTAS","NXPI","CRWD","IDXX","FTNT",
+    "AEP","ROST","MNST","WDAY","ODFL","CPRT","CDNS","XEL","PCAR","KHC",
+    "PAYX","EA","EXC","BIIB","DLTR","DXCM","VRSK","CSGP","FAST","LCID",
+    "ANSS","CHKP","ZS","DOCU","EBAY","SPLK","BIDU","NTES","OKTA","DDOG",
+    "JD","ALGN","MRVL","SGEN","MTCH","ZM","LULU","TTD","ILMN","MCHP",
+    "FISV","SWKS","CEG","CTSH","BMRN","SIRI","VERX","ZSAN","SMCI","ON"
+  ],
+
+  "russell2000": [
+    "RRGB","CALM","LESL","CROX","GME","URBN","BOOT","HOFT","SPTN","BYON"
+  ],
+
+  "crypto": [
+    "BTCUSD","ETHUSD","SOLUSD","ADAUSD","XRPUSD",
+    "DOGEUSD","MATICUSD","LTCUSD","DOTUSD","AVAXUSD"
+  ]
+}
