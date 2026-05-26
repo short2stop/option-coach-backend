@@ -300,3 +300,199 @@ async def screen(req: ScreenRequest) -> Dict[str, Any]:
         "cache": cache_status(),
         "universes": [build_universe_response(req, universe) for universe in universes],
     }
+
+
+class SignalsRequest(BaseModel):
+    universe: Literal["sp500", "dow30", "nasdaq100", "russell2000", "crypto", "all"] = "sp500"
+    horizon: Literal["1d", "1w", "1mo"] = "1d"
+    tickers: Optional[List[str]] = Field(default=None, description="Optional explicit ticker list")
+    refresh: bool = Field(default=False, description="Force a cache refresh before returning signals")
+    limit: int = Field(default=10, ge=1, le=50, description="Maximum number of ranked candidates to return")
+    min_price: float = Field(default=5.0, ge=0.0, description="Minimum underlying price")
+    min_volume: float = Field(default=500000.0, ge=0.0, description="Minimum share volume")
+
+
+def safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        if value is None:
+            return default
+        return float(value)
+    except Exception:
+        return default
+
+
+def clamp(value: float, lo: float = 0.0, hi: float = 100.0) -> float:
+    return max(lo, min(hi, value))
+
+
+def percentile_rank(value: float, values: List[float]) -> float:
+    if not values:
+        return 50.0
+    ordered = sorted(values)
+    below = sum(1 for x in ordered if x <= value)
+    return 100.0 * below / len(ordered)
+
+
+def classify_structure(score: float, day_change_pct: float, range_pct: float, close_location: float) -> str:
+    if score >= 85 and range_pct >= 3.0:
+        return "aggressive call debit spread or small-risk momentum calls"
+    if score >= 75 and close_location >= 70:
+        return "bullish call debit spread"
+    if score >= 65:
+        return "balanced bullish vertical spread"
+    return "watchlist only; wait for confirmation"
+
+
+def classify_risk(range_pct: float, day_change_pct: float, price: float) -> str:
+    abs_move = abs(day_change_pct)
+    if range_pct >= 5 or abs_move >= 4:
+        return "very high"
+    if range_pct >= 3 or abs_move >= 2.5:
+        return "high"
+    if range_pct >= 1.5:
+        return "moderate"
+    return "lower"
+
+
+def setup_label(score: float, day_change_pct: float, close_location: float) -> str:
+    if score >= 85:
+        return "aggressive momentum breakout"
+    if day_change_pct > 1.5 and close_location >= 65:
+        return "trend continuation"
+    if close_location >= 80:
+        return "strong close / relative strength"
+    if day_change_pct > 0:
+        return "constructive bullish setup"
+    return "low-priority watchlist setup"
+
+
+def build_signal_rows(req: SignalsRequest, universe: str) -> Dict[str, Any]:
+    screen_req = ScreenRequest(
+        universe=universe, horizon=req.horizon, tickers=req.tickers, refresh=False
+    )
+    raw = build_universe_response(screen_req, universe)
+    valid_rows: List[Dict[str, Any]] = []
+
+    for row in raw.get("results", []):
+        if row.get("error"):
+            continue
+        close = safe_float(row.get("close"))
+        open_ = safe_float(row.get("open"))
+        high = safe_float(row.get("high"))
+        low = safe_float(row.get("low"))
+        volume = safe_float(row.get("volume"))
+        if close < req.min_price or volume < req.min_volume or open_ <= 0 or high <= 0 or low <= 0:
+            continue
+        valid_rows.append(row)
+
+    volumes = [safe_float(r.get("volume")) for r in valid_rows]
+    dollar_volumes = [safe_float(r.get("close")) * safe_float(r.get("volume")) for r in valid_rows]
+
+    candidates: List[Dict[str, Any]] = []
+    for row in valid_rows:
+        ticker = str(row.get("requested_ticker") or row.get("ticker") or "").upper()
+        close = safe_float(row.get("close"))
+        open_ = safe_float(row.get("open"))
+        high = safe_float(row.get("high"))
+        low = safe_float(row.get("low"))
+        volume = safe_float(row.get("volume"))
+        day_change_pct = ((close - open_) / open_) * 100 if open_ else 0.0
+        day_range = max(high - low, 0.0)
+        range_pct = (day_range / close) * 100 if close else 0.0
+        close_location = ((close - low) / day_range) * 100 if day_range > 0 else 50.0
+        volume_rank = percentile_rank(volume, volumes)
+        dollar_volume_rank = percentile_rank(close * volume, dollar_volumes)
+
+        momentum_score = clamp(50 + day_change_pct * 8 + (close_location - 50) * 0.35)
+        volatility_score = clamp(range_pct * 16)
+        liquidity_score = clamp((volume_rank * 0.35) + (dollar_volume_rank * 0.65))
+        trend_quality = clamp((momentum_score * 0.65) + (close_location * 0.35))
+        overall_score = clamp(
+            momentum_score * 0.40
+            + trend_quality * 0.25
+            + liquidity_score * 0.20
+            + volatility_score * 0.15
+        )
+
+        # Trade plan uses the current cached daily range as an ATR proxy until
+        # historical bars are added. This gives consistent risk units without
+        # pretending to have full ATR/IV yet.
+        risk_per_share = max(day_range * 0.45, close * 0.012)
+        entry = round(close, 2)
+        stop = round(max(close - risk_per_share, 0.01), 2)
+        target_1 = round(close + risk_per_share * 1.5, 2)
+        target_2 = round(close + risk_per_share * 2.5, 2)
+        reward_risk = round((target_2 - entry) / max(entry - stop, 0.01), 2)
+
+        candidates.append(
+            {
+                "ticker": ticker,
+                "asset_type": row.get("asset_type"),
+                "source": row.get("source"),
+                "close": round(close, 4),
+                "open": round(open_, 4),
+                "high": round(high, 4),
+                "low": round(low, 4),
+                "volume": round(volume, 0),
+                "day_change_pct": round(day_change_pct, 2),
+                "range_pct": round(range_pct, 2),
+                "close_location_pct": round(close_location, 1),
+                "momentum_score": round(momentum_score, 1),
+                "volatility_score": round(volatility_score, 1),
+                "liquidity_score": round(liquidity_score, 1),
+                "trend_quality_score": round(trend_quality, 1),
+                "overall_score": round(overall_score, 1),
+                "setup": setup_label(overall_score, day_change_pct, close_location),
+                "risk_profile": classify_risk(range_pct, day_change_pct, close),
+                "ideal_option_structure": classify_structure(overall_score, day_change_pct, range_pct, close_location),
+                "trade_plan": {
+                    "bias": "bullish" if overall_score >= 60 else "neutral/watchlist",
+                    "entry": entry,
+                    "stop": stop,
+                    "target_1": target_1,
+                    "target_2": target_2,
+                    "risk_per_share": round(entry - stop, 2),
+                    "reward_risk_to_target_2": reward_risk,
+                    "invalidates_below": stop,
+                },
+                "notes": [
+                    "Scores are based on cached Polygon OHLCV grouped data.",
+                    "Risk plan uses daily range as a temporary ATR proxy until historical bars are added.",
+                ],
+            }
+        )
+
+    candidates.sort(key=lambda x: x.get("overall_score", 0), reverse=True)
+    return {
+        "universe": universe,
+        "candidate_count": len(candidates),
+        "returned": min(req.limit, len(candidates)),
+        "signals": candidates[: req.limit],
+        "skipped": raw.get("skipped", []),
+    }
+
+
+@app.post("/signals")
+async def signals(req: SignalsRequest) -> Dict[str, Any]:
+    if not INDEX_MAP and not req.tickers:
+        raise HTTPException(status_code=500, detail="No constituents loaded. Put constituents.json next to main.py or pass explicit tickers.")
+
+    if req.refresh or not cache_is_fresh():
+        await refresh_cache()
+
+    universes = ALL_UNIVERSES if req.universe == "all" else [req.universe]
+    return {
+        "horizon": req.horizon,
+        "polygon_enabled": bool(POLYGON_API_KEY),
+        "cache": cache_status(),
+        "methodology": {
+            "version": "signals_v1_ohlcv",
+            "inputs": ["open", "high", "low", "close", "volume", "dollar volume", "close location"],
+            "limitations": [
+                "No multi-day historical bars yet.",
+                "No options chain, implied volatility, Greeks, earnings calendar, or live news yet.",
+                "Stops/targets use daily range as an ATR proxy until historical bars are added.",
+            ],
+        },
+        "universes": [build_signal_rows(req, universe) for universe in universes],
+    }
