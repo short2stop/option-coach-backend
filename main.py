@@ -277,7 +277,7 @@ async def screen(req: ScreenRequest) -> Dict[str, Any]:
         )
 
     timeout = httpx.Timeout(connect=10.0, read=20.0, write=10.0, pool=20.0)
-    semaphore = asyncio.Semaphore(CONCURRENCY_LIMIT)
+    semaphore = asyncio.Semaphore(3)
 
     async with httpx.AsyncClient(timeout=timeout) as client:
         output = [
