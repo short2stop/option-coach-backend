@@ -11,7 +11,7 @@ import httpx
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
-app = FastAPI(title="Option Coach Backend")
+app = FastAPI(title="Option Coach Backend - Signals v2")
 
 POLYGON_API_KEY = os.getenv("POLYGON_API_KEY", "").strip()
 POLYGON_BASE = "https://api.polygon.io/v2"
@@ -27,6 +27,7 @@ CACHE: Dict[str, Any] = {
     "market_date": None,
     "stock_rows": {},
     "crypto_rows": {},
+    "history_rows": {},
     "errors": [],
 }
 
@@ -148,6 +149,94 @@ async def fetch_grouped_stocks(client: httpx.AsyncClient) -> tuple[Dict[str, Dic
     return {}, None, errors or ["Could not fetch grouped stock data"]
 
 
+async def fetch_grouped_stocks_for_date(client: httpx.AsyncClient, market_date: str) -> tuple[Dict[str, Dict[str, Any]], List[str]]:
+    errors: List[str] = []
+    if not POLYGON_API_KEY:
+        return {}, ["POLYGON_API_KEY is not loaded"]
+
+    url = f"{POLYGON_BASE}/aggs/grouped/locale/us/market/stocks/{market_date}"
+    params = {"adjusted": "true", "apiKey": POLYGON_API_KEY}
+    try:
+        resp = await client.get(url, params=params)
+    except Exception as e:
+        return {}, [f"Grouped stocks request failed for {market_date}: {e}"]
+
+    if resp.status_code in {401, 403}:
+        return {}, ["Polygon authentication failed. Check POLYGON_API_KEY in Render."]
+    if resp.status_code == 429:
+        return {}, [f"Polygon rate limit hit while fetching grouped stocks for {market_date}."]
+    if resp.status_code != 200:
+        return {}, [f"Polygon grouped stocks HTTP {resp.status_code} for {market_date}: {resp.text[:200]}"]
+
+    data = resp.json()
+    rows = data.get("results") or []
+    if not rows:
+        return {}, [f"No grouped stock rows returned for {market_date}"]
+
+    mapped: Dict[str, Dict[str, Any]] = {}
+    for r in rows:
+        ticker = str(r.get("T", "")).upper()
+        if not ticker:
+            continue
+        mapped[ticker] = {
+            "ticker": ticker,
+            "date": market_date,
+            "close": r.get("c"),
+            "open": r.get("o"),
+            "high": r.get("h"),
+            "low": r.get("l"),
+            "volume": r.get("v"),
+        }
+    return mapped, errors
+
+
+def recent_weekday_dates(days_back: int = 60) -> List[str]:
+    dates: List[str] = []
+    d = datetime.now(timezone.utc).date()
+    for i in range(1, days_back + 1):
+        candidate = d - timedelta(days=i)
+        if candidate.weekday() < 5:
+            dates.append(candidate.isoformat())
+    return dates
+
+
+async def fetch_historical_grouped_stocks(
+    client: httpx.AsyncClient,
+    market_dates: List[str],
+    max_market_days: int = 30,
+) -> tuple[Dict[str, List[Dict[str, Any]]], List[str]]:
+    """Fetch recent market-wide grouped stock bars.
+
+    This uses one Polygon grouped request per market day instead of one request per ticker.
+    For signals, this is the scalable way to build ATR/RSI/moving averages across a universe.
+    """
+    history: Dict[str, List[Dict[str, Any]]] = {}
+    errors: List[str] = []
+    fetched_days = 0
+
+    for market_date in market_dates:
+        rows, day_errors = await fetch_grouped_stocks_for_date(client, market_date)
+        if rows:
+            fetched_days += 1
+            for ticker, row in rows.items():
+                history.setdefault(ticker, []).append(row)
+        else:
+            errors.extend(day_errors)
+
+        # Keep this intentionally gentle for free/lower Polygon plans.
+        await asyncio.sleep(0.25)
+        if fetched_days >= max_market_days:
+            break
+
+    # Chronological order: oldest -> newest.
+    for ticker in list(history.keys()):
+        history[ticker] = sorted(history[ticker], key=lambda x: x.get("date", ""))
+
+    if fetched_days == 0:
+        errors.append("No historical grouped market days were fetched.")
+    return history, errors
+
+
 async def fetch_polygon_crypto_one(client: httpx.AsyncClient, symbol: str) -> Dict[str, Any]:
     ticker = normalize_ticker(symbol)
     pair = f"X:{ticker}"
@@ -197,16 +286,20 @@ async def fetch_crypto_rows(client: httpx.AsyncClient) -> Dict[str, Dict[str, An
 
 async def refresh_cache() -> Dict[str, Any]:
     async with CACHE_LOCK:
-        timeout = httpx.Timeout(connect=10.0, read=30.0, write=10.0, pool=30.0)
+        timeout = httpx.Timeout(connect=10.0, read=45.0, write=10.0, pool=45.0)
         async with httpx.AsyncClient(timeout=timeout) as client:
             stock_rows, market_date, stock_errors = await fetch_grouped_stocks(client)
+            history_rows, history_errors = await fetch_historical_grouped_stocks(
+                client, recent_weekday_dates(days_back=70), max_market_days=30
+            )
             crypto_rows = await fetch_crypto_rows(client)
 
         CACHE["generated_at"] = datetime.now(timezone.utc)
         CACHE["market_date"] = market_date
         CACHE["stock_rows"] = stock_rows
         CACHE["crypto_rows"] = crypto_rows
-        CACHE["errors"] = stock_errors
+        CACHE["history_rows"] = history_rows
+        CACHE["errors"] = stock_errors + history_errors
 
         return cache_status()
 
@@ -221,6 +314,7 @@ def cache_status() -> Dict[str, Any]:
         "market_date": CACHE.get("market_date"),
         "stock_count": len(CACHE.get("stock_rows") or {}),
         "crypto_count": len(CACHE.get("crypto_rows") or {}),
+        "history_ticker_count": len(CACHE.get("history_rows") or {}),
         "errors": CACHE.get("errors") or [],
     }
 
@@ -366,6 +460,110 @@ def setup_label(score: float, day_change_pct: float, close_location: float) -> s
     return "low-priority watchlist setup"
 
 
+
+def history_for_ticker(ticker: str) -> List[Dict[str, Any]]:
+    t = normalize_ticker(ticker)
+    history_rows: Dict[str, List[Dict[str, Any]]] = CACHE.get("history_rows") or {}
+    for key in [polygon_stock_key(t), t.replace("-", "."), t.replace(".", "-")]:
+        if key in history_rows:
+            return history_rows[key]
+    return []
+
+
+def simple_sma(values: List[float], window: int) -> Optional[float]:
+    if len(values) < window:
+        return None
+    subset = values[-window:]
+    return sum(subset) / window
+
+
+def calc_atr(bars: List[Dict[str, Any]], window: int = 14) -> Optional[float]:
+    if len(bars) < 2:
+        return None
+    trs: List[float] = []
+    prev_close = safe_float(bars[0].get("close"))
+    for bar in bars[1:]:
+        high = safe_float(bar.get("high"))
+        low = safe_float(bar.get("low"))
+        close = safe_float(bar.get("close"))
+        tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
+        if tr > 0:
+            trs.append(tr)
+        prev_close = close
+    if not trs:
+        return None
+    subset = trs[-window:]
+    return sum(subset) / len(subset)
+
+
+def calc_rsi(closes: List[float], window: int = 14) -> Optional[float]:
+    if len(closes) < window + 1:
+        return None
+    gains: List[float] = []
+    losses: List[float] = []
+    for i in range(-window, 0):
+        change = closes[i] - closes[i - 1]
+        gains.append(max(change, 0.0))
+        losses.append(max(-change, 0.0))
+    avg_gain = sum(gains) / window
+    avg_loss = sum(losses) / window
+    if avg_loss == 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    return 100 - (100 / (1 + rs))
+
+
+def pct_change_from_n(closes: List[float], days: int) -> Optional[float]:
+    if len(closes) <= days or closes[-days - 1] <= 0:
+        return None
+    return ((closes[-1] - closes[-days - 1]) / closes[-days - 1]) * 100
+
+
+def volume_anomaly(bars: List[Dict[str, Any]], window: int = 20) -> Optional[float]:
+    if len(bars) < 2:
+        return None
+    volumes = [safe_float(b.get("volume")) for b in bars if safe_float(b.get("volume")) > 0]
+    if len(volumes) < 2:
+        return None
+    current = volumes[-1]
+    prior = volumes[-window-1:-1] if len(volumes) > window else volumes[:-1]
+    if not prior:
+        return None
+    avg = sum(prior) / len(prior)
+    return current / avg if avg > 0 else None
+
+
+def trend_alignment_score(close: float, sma5: Optional[float], sma10: Optional[float], sma20: Optional[float]) -> float:
+    score = 50.0
+    if sma5 and close > sma5:
+        score += 15
+    if sma10 and close > sma10:
+        score += 15
+    if sma20 and close > sma20:
+        score += 20
+    if sma5 and sma10 and sma5 > sma10:
+        score += 10
+    if sma10 and sma20 and sma10 > sma20:
+        score += 10
+    return clamp(score)
+
+
+def rsi_score(rsi: Optional[float]) -> float:
+    if rsi is None:
+        return 50.0
+    # Best bullish momentum zone: strong but not too extended.
+    if 55 <= rsi <= 70:
+        return 100.0
+    if 70 < rsi <= 80:
+        return 85.0
+    if 45 <= rsi < 55:
+        return 65.0
+    if 80 < rsi <= 90:
+        return 55.0
+    if 35 <= rsi < 45:
+        return 40.0
+    return 25.0
+
 def build_signal_rows(req: SignalsRequest, universe: str) -> Dict[str, Any]:
     screen_req = ScreenRequest(
         universe=universe, horizon=req.horizon, tickers=req.tickers, refresh=False
@@ -403,21 +601,44 @@ def build_signal_rows(req: SignalsRequest, universe: str) -> Dict[str, Any]:
         volume_rank = percentile_rank(volume, volumes)
         dollar_volume_rank = percentile_rank(close * volume, dollar_volumes)
 
-        momentum_score = clamp(50 + day_change_pct * 8 + (close_location - 50) * 0.35)
-        volatility_score = clamp(range_pct * 16)
+        bars = history_for_ticker(ticker)
+        closes = [safe_float(b.get("close")) for b in bars if safe_float(b.get("close")) > 0]
+        atr14 = calc_atr(bars, 14)
+        atr_pct = (atr14 / close) * 100 if atr14 and close else None
+        rsi14 = calc_rsi(closes, 14)
+        sma5 = simple_sma(closes, 5)
+        sma10 = simple_sma(closes, 10)
+        sma20 = simple_sma(closes, 20)
+        momentum_5d = pct_change_from_n(closes, 5)
+        momentum_20d = pct_change_from_n(closes, 20)
+        vol_anom = volume_anomaly(bars, 20)
+
+        intraday_momentum_score = clamp(50 + day_change_pct * 8 + (close_location - 50) * 0.35)
+        historical_momentum_score = clamp(
+            50
+            + (momentum_5d or 0) * 4.0
+            + (momentum_20d or 0) * 1.8
+            + (rsi_score(rsi14) - 50) * 0.45
+        )
+        momentum_score = clamp(intraday_momentum_score * 0.45 + historical_momentum_score * 0.55)
+        volatility_score = clamp(((atr_pct if atr_pct is not None else range_pct) * 18) + min((vol_anom or 1) - 1, 2) * 12)
         liquidity_score = clamp((volume_rank * 0.35) + (dollar_volume_rank * 0.65))
-        trend_quality = clamp((momentum_score * 0.65) + (close_location * 0.35))
+        trend_quality = clamp(
+            trend_alignment_score(close, sma5, sma10, sma20) * 0.45
+            + close_location * 0.25
+            + rsi_score(rsi14) * 0.20
+            + clamp((momentum_20d or 0) * 4 + 50) * 0.10
+        )
         overall_score = clamp(
-            momentum_score * 0.40
-            + trend_quality * 0.25
+            momentum_score * 0.35
+            + trend_quality * 0.30
             + liquidity_score * 0.20
             + volatility_score * 0.15
         )
 
-        # Trade plan uses the current cached daily range as an ATR proxy until
-        # historical bars are added. This gives consistent risk units without
-        # pretending to have full ATR/IV yet.
-        risk_per_share = max(day_range * 0.45, close * 0.012)
+        # Use ATR when available. Fall back to current day range for symbols without sufficient history.
+        risk_unit = atr14 if atr14 and atr14 > 0 else max(day_range * 0.75, close * 0.015)
+        risk_per_share = max(risk_unit * 0.75, close * 0.01)
         entry = round(close, 2)
         stop = round(max(close - risk_per_share, 0.01), 2)
         target_1 = round(close + risk_per_share * 1.5, 2)
@@ -437,14 +658,26 @@ def build_signal_rows(req: SignalsRequest, universe: str) -> Dict[str, Any]:
                 "day_change_pct": round(day_change_pct, 2),
                 "range_pct": round(range_pct, 2),
                 "close_location_pct": round(close_location, 1),
+                "history": {
+                    "bars": len(bars),
+                    "atr14": round(atr14, 4) if atr14 is not None else None,
+                    "atr14_pct": round(atr_pct, 2) if atr_pct is not None else None,
+                    "rsi14": round(rsi14, 1) if rsi14 is not None else None,
+                    "sma5": round(sma5, 4) if sma5 is not None else None,
+                    "sma10": round(sma10, 4) if sma10 is not None else None,
+                    "sma20": round(sma20, 4) if sma20 is not None else None,
+                    "momentum_5d_pct": round(momentum_5d, 2) if momentum_5d is not None else None,
+                    "momentum_20d_pct": round(momentum_20d, 2) if momentum_20d is not None else None,
+                    "volume_anomaly_ratio": round(vol_anom, 2) if vol_anom is not None else None,
+                },
                 "momentum_score": round(momentum_score, 1),
                 "volatility_score": round(volatility_score, 1),
                 "liquidity_score": round(liquidity_score, 1),
                 "trend_quality_score": round(trend_quality, 1),
                 "overall_score": round(overall_score, 1),
                 "setup": setup_label(overall_score, day_change_pct, close_location),
-                "risk_profile": classify_risk(range_pct, day_change_pct, close),
-                "ideal_option_structure": classify_structure(overall_score, day_change_pct, range_pct, close_location),
+                "risk_profile": classify_risk(atr_pct if atr_pct is not None else range_pct, day_change_pct, close),
+                "ideal_option_structure": classify_structure(overall_score, day_change_pct, atr_pct if atr_pct is not None else range_pct, close_location),
                 "trade_plan": {
                     "bias": "bullish" if overall_score >= 60 else "neutral/watchlist",
                     "entry": entry,
@@ -456,8 +689,8 @@ def build_signal_rows(req: SignalsRequest, universe: str) -> Dict[str, Any]:
                     "invalidates_below": stop,
                 },
                 "notes": [
-                    "Scores are based on cached Polygon OHLCV grouped data.",
-                    "Risk plan uses daily range as a temporary ATR proxy until historical bars are added.",
+                    "Scores use cached Polygon grouped OHLCV plus recent grouped historical bars.",
+                    "Stops/targets use ATR(14) when available; otherwise a range-based fallback is used.",
                 ],
             }
         )
@@ -486,12 +719,15 @@ async def signals(req: SignalsRequest) -> Dict[str, Any]:
         "polygon_enabled": bool(POLYGON_API_KEY),
         "cache": cache_status(),
         "methodology": {
-            "version": "signals_v1_ohlcv",
-            "inputs": ["open", "high", "low", "close", "volume", "dollar volume", "close location"],
+            "version": "signals_v2_history",
+            "inputs": [
+                "open", "high", "low", "close", "volume", "dollar volume",
+                "30 market days of grouped historical bars", "ATR(14)", "RSI(14)",
+                "SMA(5/10/20)", "5d momentum", "20d momentum", "volume anomaly"
+            ],
             "limitations": [
-                "No multi-day historical bars yet.",
                 "No options chain, implied volatility, Greeks, earnings calendar, or live news yet.",
-                "Stops/targets use daily range as an ATR proxy until historical bars are added.",
+                "Option structures are inferred from underlying behavior until options-chain data is added.",
             ],
         },
         "universes": [build_signal_rows(req, universe) for universe in universes],
