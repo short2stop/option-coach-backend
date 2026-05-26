@@ -1,186 +1,292 @@
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
-from typing import List, Optional, Literal, Dict, Any
+from __future__ import annotations
+
 import asyncio
 import json
 import os
+from pathlib import Path
+from typing import Any, Dict, List, Literal, Optional
+
 import httpx
 import yfinance as yf
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel, Field
 
 app = FastAPI(title="Option Coach Backend")
 
-POLYGON_API_KEY = os.getenv("POLYGON_API_KEY")
+POLYGON_API_KEY = os.getenv("POLYGON_API_KEY", "").strip()
 POLYGON_BASE = "https://api.polygon.io/v2"
-
-with open("constituents.json") as f:
-    INDEX_MAP = json.load(f)
+CONSTITUENTS_FILE = Path(__file__).with_name("constituents.json")
 
 ALL_UNIVERSES = ["sp500", "dow30", "nasdaq100", "russell2000", "crypto"]
+CONCURRENCY_LIMIT = int(os.getenv("OPTION_COACH_CONCURRENCY", "20"))
+
+
+def load_constituents() -> Dict[str, List[str]]:
+    """
+    Load index ticker lists from constituents.json.
+
+    The old version crashed at import time if constituents.json was missing.
+    This keeps the server bootable and reports the file problem through /health
+    and /screen instead.
+    """
+    if not CONSTITUENTS_FILE.exists():
+        return {}
+
+    try:
+        with CONSTITUENTS_FILE.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return {}
+
+    cleaned: Dict[str, List[str]] = {}
+    for universe, tickers in data.items():
+        if isinstance(tickers, list):
+            cleaned[universe] = [
+                str(t).strip().upper()
+                for t in tickers
+                if str(t).strip()
+            ]
+    return cleaned
+
+
+INDEX_MAP = load_constituents()
 
 
 class ScreenRequest(BaseModel):
     universe: Literal["sp500", "dow30", "nasdaq100", "russell2000", "crypto", "all"]
     horizon: Literal["1d", "1w", "1mo"] = "1mo"
-    tickers: Optional[List[str]] = None
+    tickers: Optional[List[str]] = Field(default=None, description="Optional explicit ticker list")
 
 
-async def fetch_polygon_stock(ticker: str):
-    url = f"{POLYGON_BASE}/aggs/ticker/{ticker}/prev?adjusted=true&apiKey={POLYGON_API_KEY}"
-    async with httpx.AsyncClient() as client:
-        resp = await client.get(url, timeout=10)
-        if resp.status_code == 200:
-            data = resp.json()
-            if data.get("results"):
-                r = data["results"][0]
-                return {
-                    "ticker": ticker.upper(),
-                    "asset_type": "equity",
-                    "source": "polygon",
-                    "close": r["c"],
-                    "open": r["o"],
-                    "high": r["h"],
-                    "low": r["l"],
-                    "volume": r.get("v"),
-                }
-    return None
+def normalize_ticker(ticker: str) -> str:
+    return ticker.strip().upper().replace("/", "").replace("-", "")
 
 
-async def fetch_polygon_crypto(symbol: str):
-    pair = f"X:{symbol.upper()}"
-    url = f"{POLYGON_BASE}/aggs/ticker/{pair}/prev?adjusted=true&apiKey={POLYGON_API_KEY}"
-    async with httpx.AsyncClient() as client:
-        resp = await client.get(url, timeout=10)
-        if resp.status_code == 200:
-            data = resp.json()
-            if data.get("results"):
-                r = data["results"][0]
-                return {
-                    "ticker": symbol.upper(),
-                    "asset_type": "crypto",
-                    "source": "polygon",
-                    "close": r["c"],
-                    "open": r["o"],
-                    "high": r["h"],
-                    "low": r["l"],
-                    "volume": r.get("v"),
-                }
-    return None
+def is_crypto_ticker(ticker: str) -> bool:
+    # Polygon crypto aggregate tickers look like X:BTCUSD, X:ETHUSD, etc.
+    return ticker.upper().endswith("USD") and len(ticker) > 3
 
 
-def fetch_yahoo(ticker: str):
+async def fetch_polygon_stock(client: httpx.AsyncClient, ticker: str) -> Optional[Dict[str, Any]]:
+    if not POLYGON_API_KEY:
+        return None
+
+    url = f"{POLYGON_BASE}/aggs/ticker/{ticker}/prev"
+    params = {"adjusted": "true", "apiKey": POLYGON_API_KEY}
+
     try:
-        hist = yf.Ticker(ticker).history(period="1d")
-        if not hist.empty:
-            x = hist.iloc[-1]
-            return {
-                "ticker": ticker.upper(),
-                "asset_type": "equity",
-                "source": "yahoo",
-                "close": float(x["Close"]),
-                "open": float(x["Open"]),
-                "high": float(x["High"]),
-                "low": float(x["Low"]),
-                "volume": int(x["Volume"]),
-            }
+        resp = await client.get(url, params=params)
+        if resp.status_code in {401, 403}:
+            return {"ticker": ticker, "error": "Polygon authentication failed. Check POLYGON_API_KEY."}
+        if resp.status_code == 429:
+            return {"ticker": ticker, "error": "Polygon rate limit hit."}
+        if resp.status_code != 200:
+            return {"ticker": ticker, "error": f"Polygon HTTP {resp.status_code}: {resp.text[:200]}"}
+
+        data = resp.json()
+        results = data.get("results") or []
+        if not results:
+            return None
+
+        r = results[0]
+        return {
+            "ticker": ticker,
+            "asset_type": "equity",
+            "source": "polygon",
+            "close": r.get("c"),
+            "open": r.get("o"),
+            "high": r.get("h"),
+            "low": r.get("l"),
+            "volume": r.get("v"),
+        }
     except Exception as e:
-        return {"ticker": ticker.upper(), "error": f"Yahoo fail: {str(e)}"}
-    return {"ticker": ticker.upper(), "error": "No data available"}
+        return {"ticker": ticker, "error": f"Polygon stock request failed: {e}"}
 
 
-async def fetch_ticker(ticker: str):
-    if ticker.upper().endswith("USD"):
-        data = await fetch_polygon_crypto(ticker)
-        return data or {"ticker": ticker.upper(), "error": "No crypto data available"}
-    data = await fetch_polygon_stock(ticker)
-    return data or fetch_yahoo(ticker)
+async def fetch_polygon_crypto(client: httpx.AsyncClient, symbol: str) -> Optional[Dict[str, Any]]:
+    if not POLYGON_API_KEY:
+        return None
 
-
-def chunked(items: List[str], size: int):
-    for i in range(0, len(items), size):
-        yield items[i:i + size]
-
-
-async def fetch_batch(batch: List[str]) -> List[Dict[str, Any]]:
-    tasks = [fetch_ticker(t) for t in batch]
-    return await asyncio.gather(*tasks)
-
-
-async def fetch_with_isolation(batch: List[str], skipped: List[str]) -> List[Dict[str, Any]]:
-    sizes = [100, 50, 25, 10, 5, 1]
-    for size in sizes:
-        if len(batch) <= size:
-            try:
-                return await fetch_batch(batch)
-            except Exception:
-                if len(batch) == 1:
-                    skipped.append(batch[0])
-                    return [{"ticker": batch[0], "error": "Skipped after isolation"}]
-                out = []
-                mid = len(batch) // 2
-                out.extend(await fetch_with_isolation(batch[:mid], skipped))
-                out.extend(await fetch_with_isolation(batch[mid:], skipped))
-                return out
+    normalized = normalize_ticker(symbol)
+    pair = f"X:{normalized}"
+    url = f"{POLYGON_BASE}/aggs/ticker/{pair}/prev"
+    params = {"adjusted": "true", "apiKey": POLYGON_API_KEY}
 
     try:
-        return await fetch_batch(batch)
-    except Exception:
-        results = []
-        for t in batch:
-            try:
-                results.extend(await fetch_with_isolation([t], skipped))
-            except Exception:
-                skipped.append(t)
-                results.append({"ticker": t, "error": "Skipped after repeated failure"})
-        return results
+        resp = await client.get(url, params=params)
+        if resp.status_code in {401, 403}:
+            return {"ticker": normalized, "error": "Polygon authentication failed. Check POLYGON_API_KEY."}
+        if resp.status_code == 429:
+            return {"ticker": normalized, "error": "Polygon rate limit hit."}
+        if resp.status_code != 200:
+            return {"ticker": normalized, "error": f"Polygon HTTP {resp.status_code}: {resp.text[:200]}"}
+
+        data = resp.json()
+        results = data.get("results") or []
+        if not results:
+            return None
+
+        r = results[0]
+        return {
+            "ticker": normalized,
+            "asset_type": "crypto",
+            "source": "polygon",
+            "close": r.get("c"),
+            "open": r.get("o"),
+            "high": r.get("h"),
+            "low": r.get("l"),
+            "volume": r.get("v"),
+        }
+    except Exception as e:
+        return {"ticker": normalized, "error": f"Polygon crypto request failed: {e}"}
 
 
-async def process_universe(name: str) -> Dict[str, Any]:
-    tickers = INDEX_MAP.get(name, [])
+def fetch_yahoo_sync(ticker: str) -> Dict[str, Any]:
+    """
+    yfinance is synchronous, so this function is called with asyncio.to_thread().
+    """
+    try:
+        hist = yf.Ticker(ticker).history(period="5d", interval="1d")
+        if hist.empty:
+            return {"ticker": ticker, "error": "No Yahoo data available"}
+
+        x = hist.iloc[-1]
+        return {
+            "ticker": ticker,
+            "asset_type": "equity",
+            "source": "yahoo",
+            "close": float(x["Close"]),
+            "open": float(x["Open"]),
+            "high": float(x["High"]),
+            "low": float(x["Low"]),
+            "volume": int(x["Volume"]) if not str(x["Volume"]) == "nan" else None,
+        }
+    except Exception as e:
+        return {"ticker": ticker, "error": f"Yahoo request failed: {e}"}
+
+
+async def fetch_yahoo(ticker: str) -> Dict[str, Any]:
+    return await asyncio.to_thread(fetch_yahoo_sync, ticker)
+
+
+async def fetch_ticker(
+    client: httpx.AsyncClient,
+    ticker: str,
+    semaphore: asyncio.Semaphore,
+) -> Dict[str, Any]:
+    ticker = normalize_ticker(ticker)
+
+    async with semaphore:
+        if not ticker:
+            return {"ticker": ticker, "error": "Blank ticker"}
+
+        if is_crypto_ticker(ticker):
+            data = await fetch_polygon_crypto(client, ticker)
+            return data or {"ticker": ticker, "asset_type": "crypto", "error": "No crypto data available"}
+
+        polygon_result = await fetch_polygon_stock(client, ticker)
+
+        # If Polygon explicitly errors, return that error unless Yahoo can rescue missing data.
+        if polygon_result and "error" not in polygon_result:
+            return polygon_result
+
+        yahoo_result = await fetch_yahoo(ticker)
+        if "error" not in yahoo_result:
+            yahoo_result["fallback_reason"] = polygon_result.get("error") if isinstance(polygon_result, dict) else "Polygon unavailable"
+            return yahoo_result
+
+        if polygon_result and "error" in polygon_result:
+            return {
+                "ticker": ticker,
+                "error": f"{polygon_result['error']} | {yahoo_result['error']}",
+            }
+
+        return yahoo_result
+
+
+def tickers_for_request(req: ScreenRequest, universe: str) -> List[str]:
+    if req.tickers:
+        return sorted({normalize_ticker(t) for t in req.tickers if normalize_ticker(t)})
+
+    tickers = INDEX_MAP.get(universe, [])
+    return sorted({normalize_ticker(t) for t in tickers if normalize_ticker(t)})
+
+
+async def process_universe(
+    req: ScreenRequest,
+    universe: str,
+    client: httpx.AsyncClient,
+    semaphore: asyncio.Semaphore,
+) -> Dict[str, Any]:
+    tickers = tickers_for_request(req, universe)
+
     if not tickers:
-        return {"universe": name, "results": [], "skipped": [], "errors": ["Unknown or empty universe"]}
+        errors = [f"Unknown or empty universe: {universe}"]
+        if not INDEX_MAP and not req.tickers:
+            errors.append(f"Could not load {CONSTITUENTS_FILE}")
+        return {"universe": universe, "results": [], "skipped": [], "errors": errors}
 
-    skipped = []
-    results = []
+    tasks = [fetch_ticker(client, ticker, semaphore) for ticker in tickers]
+    raw_results = await asyncio.gather(*tasks, return_exceptions=True)
 
-    for batch in chunked(tickers, 100):
-        try:
-            batch_results = await fetch_with_isolation(batch, skipped)
-            results.extend(batch_results)
-        except Exception as e:
-            try:
-                batch_results = await fetch_with_isolation(batch, skipped)
-                results.extend(batch_results)
-            except Exception:
-                for t in batch:
-                    skipped.append(t)
-                    results.append({"ticker": t, "error": f"Batch failed twice: {str(e)}"})
+    results: List[Dict[str, Any]] = []
+    skipped: List[str] = []
+
+    for ticker, result in zip(tickers, raw_results):
+        if isinstance(result, Exception):
+            skipped.append(ticker)
+            results.append({"ticker": ticker, "error": str(result)})
+        else:
+            if result.get("error"):
+                skipped.append(ticker)
+            results.append(result)
 
     return {
-        "universe": name,
+        "universe": universe,
+        "count": len(results),
         "results": results,
         "skipped": sorted(set(skipped)),
     }
 
 
 @app.get("/")
-def read_root():
+def read_root() -> Dict[str, str]:
     return {"message": "Option Coach Backend is running."}
 
 
 @app.get("/health")
-def health():
-    return {"ok": True}
+def health() -> Dict[str, Any]:
+    return {
+        "ok": True,
+        "polygon_api_key_loaded": bool(POLYGON_API_KEY),
+        "constituents_file": str(CONSTITUENTS_FILE),
+        "constituents_loaded": bool(INDEX_MAP),
+        "universes_loaded": sorted(INDEX_MAP.keys()),
+        "concurrency_limit": CONCURRENCY_LIMIT,
+    }
 
 
 @app.post("/screen")
-async def screen(req: ScreenRequest):
+async def screen(req: ScreenRequest) -> Dict[str, Any]:
     universes = ALL_UNIVERSES if req.universe == "all" else [req.universe]
 
-    output = []
-    for universe in universes:
-        output.append(await process_universe(universe))
+    if not req.tickers and not INDEX_MAP:
+        raise HTTPException(
+            status_code=500,
+            detail=f"No constituents loaded. Put constituents.json next to main.py or pass explicit tickers.",
+        )
+
+    timeout = httpx.Timeout(connect=10.0, read=20.0, write=10.0, pool=20.0)
+    semaphore = asyncio.Semaphore(CONCURRENCY_LIMIT)
+
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        output = [
+            await process_universe(req=req, universe=universe, client=client, semaphore=semaphore)
+            for universe in universes
+        ]
 
     return {
         "horizon": req.horizon,
+        "polygon_enabled": bool(POLYGON_API_KEY),
         "universes": output,
     }
