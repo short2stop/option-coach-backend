@@ -6,6 +6,7 @@ import os
 import smtplib
 import ssl
 from datetime import datetime, timedelta, timezone
+from uuid import uuid4
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional
 from email.mime.multipart import MIMEMultipart
@@ -23,6 +24,11 @@ CONSTITUENTS_FILE = Path(__file__).with_name("constituents.json")
 
 ALL_UNIVERSES = ["sp500", "dow30", "nasdaq100", "russell2000", "crypto"]
 CACHE_MAX_AGE_SECONDS = int(os.getenv("OPTION_COACH_CACHE_SECONDS", str(60 * 60 * 12)))
+
+DATA_DIR = Path(os.getenv("OPTION_COACH_DATA_DIR", "/var/data"))
+TRACKED_SIGNALS_FILE = DATA_DIR / "tracked_signals.json"
+TRACKING_MAX_DAYS = int(os.getenv("OPTION_COACH_TRACKING_MAX_DAYS", "7"))
+TRACKING_TOP_N = int(os.getenv("OPTION_COACH_TRACKING_TOP_N", "10"))
 
 EMAIL_ADDRESS = os.getenv("EMAIL_ADDRESS", "").strip()
 EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD", "").strip()
@@ -592,6 +598,8 @@ def health() -> Dict[str, Any]:
         "universes_loaded": sorted(INDEX_MAP.keys()),
         "cache": cache_status(),
         "email_configured": bool(EMAIL_ADDRESS and EMAIL_PASSWORD and EMAIL_RECIPIENT),
+        "tracking_file": str(TRACKED_SIGNALS_FILE),
+        "tracking_records": len(load_tracked_signals()) if TRACKED_SIGNALS_FILE.exists() else 0,
     }
 
 
@@ -954,24 +962,29 @@ async def signals(req: SignalsRequest) -> Dict[str, Any]:
         await refresh_cache()
 
     universes = ALL_UNIVERSES if req.universe == "all" else [req.universe]
-    return {
+    payload = {
         "horizon": req.horizon,
         "polygon_enabled": bool(POLYGON_API_KEY),
         "cache": cache_status(),
         "methodology": {
-            "version": "signals_v4_intraday_rank_boost",
+            "version": "signals_v5_feedback_tracking",
             "inputs": [
                 "open", "high", "low", "close", "volume", "dollar volume",
                 "30 market days of grouped historical bars", "ATR(14)", "RSI(14)",
-                "SMA(5/10/20)", "5d momentum", "20d momentum", "volume anomaly", "live intraday snapshot", "intraday confirmation", "intraday ranking boost", "VWAP/HOD confirmation"
+                "SMA(5/10/20)", "5d momentum", "20d momentum", "volume anomaly",
+                "live intraday snapshot", "intraday confirmation", "intraday ranking boost",
+                "VWAP/HOD confirmation", "recommendation tracking", "target-before-stop grading"
             ],
             "limitations": [
                 "No options chain, implied volatility, Greeks, earnings calendar, or live news yet.",
                 "Option structures are inferred from underlying behavior until options-chain data is added.",
+                "Daily-bar grading cannot determine exact intraday order if stop and target hit on the same daily candle.",
             ],
         },
         "universes": [await build_signal_rows(req, universe) for universe in universes],
     }
+    payload["tracking"] = track_signal_recommendations(payload)
+    return payload
 
 
 
@@ -994,6 +1007,13 @@ def signal_report_text(payload: Dict[str, Any]) -> str:
     lines.append("Option Coach Daily Report")
     lines.append(f"Market date: {cache.get('market_date')}")
     lines.append(f"Cache generated: {cache.get('generated_at')}")
+    perf = payload.get("performance", {}) or {}
+    if perf:
+        lines.append("")
+        lines.append("Performance Feedback")
+        lines.append(f"Tracked total: {perf.get('tracked_total')} | Closed: {perf.get('closed_total')} | Open: {perf.get('open_total')}")
+        lines.append(f"Clean win rate: {perf.get('clean_win_rate_pct')}% | Any target rate: {perf.get('any_target_rate_pct')}%")
+        lines.append(f"Clean wins: {perf.get('clean_wins')} | Messy wins after stop: {perf.get('messy_wins_target_after_stop')} | Losses: {perf.get('losses_stop_before_target')}")
     lines.append("")
 
     for universe_block in payload.get("universes", []):
@@ -1099,6 +1119,17 @@ def signal_report_html(payload: Dict[str, Any]) -> str:
         <p><strong>Cache fresh:</strong> {esc(cache.get('fresh'))} | <strong>History tickers:</strong> {esc(cache.get('history_ticker_count'))}</p>
         <p><strong>Methodology:</strong> {esc(methodology.get('version'))}</p>
       </div>
+      <div class="card">
+        <h2>Performance Feedback</h2>
+        <p><strong>Tracked:</strong> {esc((payload.get('performance') or {}).get('tracked_total'))}
+        | <strong>Closed:</strong> {esc((payload.get('performance') or {}).get('closed_total'))}
+        | <strong>Open:</strong> {esc((payload.get('performance') or {}).get('open_total'))}</p>
+        <p><strong>Clean win rate:</strong> {esc((payload.get('performance') or {}).get('clean_win_rate_pct'))}%
+        | <strong>Any target rate:</strong> {esc((payload.get('performance') or {}).get('any_target_rate_pct'))}%</p>
+        <p><strong>Clean wins:</strong> {esc((payload.get('performance') or {}).get('clean_wins'))}
+        | <strong>Messy wins after stop:</strong> {esc((payload.get('performance') or {}).get('messy_wins_target_after_stop'))}
+        | <strong>Losses:</strong> {esc((payload.get('performance') or {}).get('losses_stop_before_target'))}</p>
+      </div>
       {''.join(rows_html)}
       <div class="card">
         <h2>System Notes</h2>
@@ -1146,6 +1177,8 @@ async def daily_report(req: DailyReportRequest) -> Dict[str, Any]:
     if req.refresh or not cache_is_fresh():
         await refresh_cache()
 
+    performance_summary = await evaluate_tracked_signals()
+
     signals_req = SignalsRequest(
         universe=req.universe,
         horizon=req.horizon,
@@ -1157,8 +1190,9 @@ async def daily_report(req: DailyReportRequest) -> Dict[str, Any]:
         "horizon": signals_req.horizon,
         "polygon_enabled": bool(POLYGON_API_KEY),
         "cache": cache_status(),
+        "performance": performance_summary,
         "methodology": {
-            "version": "signals_v4_intraday_rank_boost",
+            "version": "signals_v5_feedback_tracking",
             "inputs": [
                 "open", "high", "low", "close", "volume", "dollar volume",
                 "30 market days of grouped historical bars", "ATR(14)", "RSI(14)",
@@ -1171,6 +1205,7 @@ async def daily_report(req: DailyReportRequest) -> Dict[str, Any]:
         },
         "universes": [await build_signal_rows(signals_req, universe) for universe in universes],
     }
+    payload["tracking"] = track_signal_recommendations(payload)
 
     subject_date = payload.get("cache", {}).get("market_date") or datetime.now(timezone.utc).date().isoformat()
     subject = f"{req.subject_prefix} — {str(req.universe).upper()} — {subject_date}"
@@ -1186,6 +1221,8 @@ async def daily_report(req: DailyReportRequest) -> Dict[str, Any]:
         "email": email_status,
         "subject": subject,
         "cache": payload.get("cache"),
+        "performance": performance_summary,
+        "tracking": payload.get("tracking"),
         "summary": {
             "universe": req.universe,
             "horizon": req.horizon,
