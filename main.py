@@ -280,6 +280,87 @@ async def fetch_polygon_crypto_one(client: httpx.AsyncClient, symbol: str) -> Di
         return {"ticker": ticker, "error": f"Polygon crypto request failed: {e}"}
 
 
+async def fetch_intraday_snapshot(
+    client: httpx.AsyncClient,
+    ticker: str,
+) -> Dict[str, Any]:
+
+    if not POLYGON_API_KEY:
+        return {"ticker": ticker, "error": "Polygon API key missing"}
+
+    url = f"https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/tickers/{ticker}"
+
+    params = {
+        "apiKey": POLYGON_API_KEY
+    }
+
+    try:
+        resp = await client.get(url, params=params)
+
+        if resp.status_code != 200:
+            return {
+                "ticker": ticker,
+                "error": f"Snapshot HTTP {resp.status_code}"
+            }
+
+        data = resp.json()
+        ticker_data = data.get("ticker", {})
+
+        day = ticker_data.get("day", {})
+        prev_day = ticker_data.get("prevDay", {})
+
+        current_price = safe_float(day.get("c"))
+        open_price = safe_float(day.get("o"))
+        high_price = safe_float(day.get("h"))
+        low_price = safe_float(day.get("l"))
+
+        prev_close = safe_float(prev_day.get("c"))
+
+        intraday_change_pct = safe_float(
+            ticker_data.get("todaysChangePerc")
+        )
+
+        distance_from_high_pct = 0.0
+
+        if high_price > 0:
+            distance_from_high_pct = (
+                (current_price - high_price) / high_price
+            ) * 100
+
+        intraday_confirmed = (
+            intraday_change_pct > 0
+            and current_price >= open_price
+            and distance_from_high_pct > -2.0
+        )
+
+        return {
+            "ticker": ticker,
+            "current_price": round(current_price, 2),
+            "open": round(open_price, 2),
+            "high": round(high_price, 2),
+            "low": round(low_price, 2),
+            "prev_close": round(prev_close, 2),
+            "intraday_change_pct": round(intraday_change_pct, 2),
+            "distance_from_high_pct": round(distance_from_high_pct, 2),
+            "intraday_confirmed": intraday_confirmed,
+            "entry_status": (
+                "active_candidate"
+                if intraday_confirmed
+                else "watchlist_only"
+            ),
+            "reason": (
+                "Bullish intraday confirmation passed"
+                if intraday_confirmed
+                else "Bullish setup failed intraday confirmation"
+            ),
+        }
+
+    except Exception as e:
+        return {
+            "ticker": ticker,
+            "error": str(e)
+        }
+
 async def fetch_crypto_rows(client: httpx.AsyncClient) -> Dict[str, Dict[str, Any]]:
     crypto_tickers = INDEX_MAP.get("crypto", [])
     if not crypto_tickers:
