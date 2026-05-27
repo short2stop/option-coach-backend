@@ -3,9 +3,13 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import smtplib
+import ssl
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
 
 import httpx
 from fastapi import FastAPI, HTTPException
@@ -19,6 +23,12 @@ CONSTITUENTS_FILE = Path(__file__).with_name("constituents.json")
 
 ALL_UNIVERSES = ["sp500", "dow30", "nasdaq100", "russell2000", "crypto"]
 CACHE_MAX_AGE_SECONDS = int(os.getenv("OPTION_COACH_CACHE_SECONDS", str(60 * 60 * 12)))
+
+EMAIL_ADDRESS = os.getenv("EMAIL_ADDRESS", "").strip()
+EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD", "").strip()
+EMAIL_RECIPIENT = os.getenv("EMAIL_RECIPIENT", "").strip()
+EMAIL_SMTP_HOST = os.getenv("EMAIL_SMTP_HOST", "smtp.gmail.com").strip()
+EMAIL_SMTP_PORT = int(os.getenv("EMAIL_SMTP_PORT", "465"))
 
 # In-memory cache. This is enough for Render web service runtime.
 # The morning cron can hit /refresh so GPT/user requests read cached data.
@@ -369,6 +379,7 @@ def health() -> Dict[str, Any]:
         "constituents_loaded": bool(INDEX_MAP),
         "universes_loaded": sorted(INDEX_MAP.keys()),
         "cache": cache_status(),
+        "email_configured": bool(EMAIL_ADDRESS and EMAIL_PASSWORD and EMAIL_RECIPIENT),
     }
 
 
@@ -731,4 +742,230 @@ async def signals(req: SignalsRequest) -> Dict[str, Any]:
             ],
         },
         "universes": [build_signal_rows(req, universe) for universe in universes],
+    }
+
+
+
+class DailyReportRequest(BaseModel):
+    universe: Literal["sp500", "dow30", "nasdaq100", "russell2000", "crypto", "all"] = "sp500"
+    horizon: Literal["1d", "1w", "1mo"] = "1d"
+    limit: int = Field(default=10, ge=1, le=25, description="Number of ranked setups to include in the email")
+    refresh: bool = Field(default=False, description="Refresh cache before building the report")
+    subject_prefix: str = Field(default="Option Coach Daily Report", description="Email subject prefix")
+    send_email: bool = Field(default=True, description="If false, return the report without sending email")
+
+
+def email_recipients() -> List[str]:
+    return [x.strip() for x in EMAIL_RECIPIENT.split(",") if x.strip()]
+
+
+def signal_report_text(payload: Dict[str, Any]) -> str:
+    cache = payload.get("cache", {})
+    lines = []
+    lines.append("Option Coach Daily Report")
+    lines.append(f"Market date: {cache.get('market_date')}")
+    lines.append(f"Cache generated: {cache.get('generated_at')}")
+    lines.append("")
+
+    for universe_block in payload.get("universes", []):
+        lines.append(f"Universe: {universe_block.get('universe')} | Candidates: {universe_block.get('candidate_count')} | Returned: {universe_block.get('returned')}")
+        lines.append("")
+        for i, sig in enumerate(universe_block.get("signals", []), start=1):
+            hist = sig.get("history", {}) or {}
+            trade = sig.get("trade_plan", {}) or {}
+            lines.append(f"{i}. {sig.get('ticker')} — {sig.get('setup')} | Score {sig.get('overall_score')}")
+            lines.append(f"   Close: {sig.get('close')} | RSI14: {hist.get('rsi14')} | ATR14: {hist.get('atr14')} ({hist.get('atr14_pct')}%)")
+            lines.append(f"   5d: {hist.get('momentum_5d_pct')}% | 20d: {hist.get('momentum_20d_pct')}% | Volume anomaly: {hist.get('volume_anomaly_ratio')}x")
+            lines.append(f"   Entry: {trade.get('entry')} | Stop: {trade.get('stop')} | T1: {trade.get('target_1')} | T2: {trade.get('target_2')} | R/R: {trade.get('reward_risk_to_target_2')}")
+            lines.append(f"   Structure: {sig.get('ideal_option_structure')} | Risk: {sig.get('risk_profile')}")
+            lines.append("")
+        skipped = universe_block.get("skipped") or []
+        if skipped:
+            lines.append(f"Skipped: {', '.join(skipped)}")
+            lines.append("")
+    return "\n".join(lines)
+
+
+def esc(value: Any) -> str:
+    text = "" if value is None else str(value)
+    return (
+        text.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+    )
+
+
+def signal_report_html(payload: Dict[str, Any]) -> str:
+    cache = payload.get("cache", {})
+    methodology = payload.get("methodology", {})
+    rows_html = []
+    for universe_block in payload.get("universes", []):
+        rows_html.append(f"<h2>{esc(universe_block.get('universe', '')).upper()} Signals</h2>")
+        rows_html.append(
+            f"<p><strong>Candidates:</strong> {esc(universe_block.get('candidate_count'))} &nbsp; "
+            f"<strong>Returned:</strong> {esc(universe_block.get('returned'))}</p>"
+        )
+        rows_html.append("""
+        <table>
+          <thead>
+            <tr>
+              <th>#</th><th>Ticker</th><th>Setup</th><th>Score</th><th>Close</th>
+              <th>RSI</th><th>ATR%</th><th>20d Mom</th><th>Vol Anom</th>
+              <th>Entry</th><th>Stop</th><th>T1</th><th>T2</th><th>R/R</th><th>Structure</th>
+            </tr>
+          </thead><tbody>
+        """)
+        for i, sig in enumerate(universe_block.get("signals", []), start=1):
+            hist = sig.get("history", {}) or {}
+            trade = sig.get("trade_plan", {}) or {}
+            rows_html.append(
+                "<tr>"
+                f"<td>{i}</td>"
+                f"<td><strong>{esc(sig.get('ticker'))}</strong></td>"
+                f"<td>{esc(sig.get('setup'))}<br><small>{esc(sig.get('risk_profile'))}</small></td>"
+                f"<td>{esc(sig.get('overall_score'))}</td>"
+                f"<td>{esc(sig.get('close'))}</td>"
+                f"<td>{esc(hist.get('rsi14'))}</td>"
+                f"<td>{esc(hist.get('atr14_pct'))}</td>"
+                f"<td>{esc(hist.get('momentum_20d_pct'))}%</td>"
+                f"<td>{esc(hist.get('volume_anomaly_ratio'))}x</td>"
+                f"<td>{esc(trade.get('entry'))}</td>"
+                f"<td>{esc(trade.get('stop'))}</td>"
+                f"<td>{esc(trade.get('target_1'))}</td>"
+                f"<td>{esc(trade.get('target_2'))}</td>"
+                f"<td>{esc(trade.get('reward_risk_to_target_2'))}</td>"
+                f"<td>{esc(sig.get('ideal_option_structure'))}</td>"
+                "</tr>"
+            )
+        rows_html.append("</tbody></table>")
+        skipped = universe_block.get("skipped") or []
+        if skipped:
+            rows_html.append(f"<p><strong>Skipped:</strong> {esc(', '.join(skipped))}</p>")
+
+    errors = cache.get("errors") or []
+    errors_html = "" if not errors else "<ul>" + "".join(f"<li>{esc(e)}</li>" for e in errors[:10]) + "</ul>"
+    if len(errors) > 10:
+        errors_html += f"<p><em>{len(errors) - 10} additional cache warnings omitted.</em></p>"
+
+    return f"""
+    <!doctype html>
+    <html>
+    <head>
+      <meta charset="utf-8">
+      <style>
+        body {{ font-family: Arial, sans-serif; color: #1f2937; line-height: 1.45; }}
+        .card {{ border: 1px solid #e5e7eb; border-radius: 10px; padding: 16px; margin: 16px 0; }}
+        table {{ border-collapse: collapse; width: 100%; font-size: 13px; }}
+        th, td {{ border: 1px solid #e5e7eb; padding: 7px; vertical-align: top; }}
+        th {{ background: #f3f4f6; text-align: left; }}
+        small {{ color: #6b7280; }}
+      </style>
+    </head>
+    <body>
+      <h1>Option Coach Daily Report</h1>
+      <div class="card">
+        <p><strong>Market date:</strong> {esc(cache.get('market_date'))}</p>
+        <p><strong>Cache generated:</strong> {esc(cache.get('generated_at'))}</p>
+        <p><strong>Cache fresh:</strong> {esc(cache.get('fresh'))} | <strong>History tickers:</strong> {esc(cache.get('history_ticker_count'))}</p>
+        <p><strong>Methodology:</strong> {esc(methodology.get('version'))}</p>
+      </div>
+      {''.join(rows_html)}
+      <div class="card">
+        <h2>System Notes</h2>
+        <p>This report is generated from the backend quantitative signal engine using cached Polygon grouped stock data and recent historical bars.</p>
+        <p>Current limitations: no options chains, Greeks, implied volatility, earnings calendar, unusual options flow, or live news yet.</p>
+        <h3>Cache warnings</h3>
+        {errors_html or '<p>None.</p>'}
+      </div>
+    </body>
+    </html>
+    """
+
+
+def send_email_report(subject: str, html_body: str, text_body: str) -> Dict[str, Any]:
+    recipients = email_recipients()
+    if not EMAIL_ADDRESS or not EMAIL_PASSWORD or not recipients:
+        raise HTTPException(
+            status_code=500,
+            detail="Email is not configured. Set EMAIL_ADDRESS, EMAIL_PASSWORD, and EMAIL_RECIPIENT in Render.",
+        )
+
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = subject
+    msg["From"] = EMAIL_ADDRESS
+    msg["To"] = ", ".join(recipients)
+    msg.attach(MIMEText(text_body, "plain"))
+    msg.attach(MIMEText(html_body, "html"))
+
+    context = ssl.create_default_context()
+    try:
+        with smtplib.SMTP_SSL(EMAIL_SMTP_HOST, EMAIL_SMTP_PORT, context=context) as server:
+            server.login(EMAIL_ADDRESS, EMAIL_PASSWORD)
+            server.sendmail(EMAIL_ADDRESS, recipients, msg.as_string())
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to send email report: {e}")
+
+    return {"sent": True, "recipients": recipients, "recipient_count": len(recipients)}
+
+
+@app.post("/daily_report")
+async def daily_report(req: DailyReportRequest) -> Dict[str, Any]:
+    if not INDEX_MAP:
+        raise HTTPException(status_code=500, detail="No constituents loaded. Put constituents.json next to main.py.")
+
+    if req.refresh or not cache_is_fresh():
+        await refresh_cache()
+
+    signals_req = SignalsRequest(
+        universe=req.universe,
+        horizon=req.horizon,
+        limit=req.limit,
+        refresh=False,
+    )
+    universes = ALL_UNIVERSES if signals_req.universe == "all" else [signals_req.universe]
+    payload = {
+        "horizon": signals_req.horizon,
+        "polygon_enabled": bool(POLYGON_API_KEY),
+        "cache": cache_status(),
+        "methodology": {
+            "version": "signals_v2_history",
+            "inputs": [
+                "open", "high", "low", "close", "volume", "dollar volume",
+                "30 market days of grouped historical bars", "ATR(14)", "RSI(14)",
+                "SMA(5/10/20)", "5d momentum", "20d momentum", "volume anomaly"
+            ],
+            "limitations": [
+                "No options chain, implied volatility, Greeks, earnings calendar, or live news yet.",
+                "Option structures are inferred from underlying behavior until options-chain data is added.",
+            ],
+        },
+        "universes": [build_signal_rows(signals_req, universe) for universe in universes],
+    }
+
+    subject_date = payload.get("cache", {}).get("market_date") or datetime.now(timezone.utc).date().isoformat()
+    subject = f"{req.subject_prefix} — {str(req.universe).upper()} — {subject_date}"
+    text_body = signal_report_text(payload)
+    html_body = signal_report_html(payload)
+
+    email_status = {"sent": False, "recipients": email_recipients(), "recipient_count": len(email_recipients())}
+    if req.send_email:
+        email_status = send_email_report(subject, html_body, text_body)
+
+    return {
+        "ok": True,
+        "email": email_status,
+        "subject": subject,
+        "cache": payload.get("cache"),
+        "summary": {
+            "universe": req.universe,
+            "horizon": req.horizon,
+            "limit": req.limit,
+            "top_tickers": [
+                s.get("ticker")
+                for u in payload.get("universes", [])
+                for s in (u.get("signals") or [])[: req.limit]
+            ][: req.limit],
+        },
+        "preview_text": text_body[:4000],
     }
