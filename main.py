@@ -379,9 +379,66 @@ async def fetch_intraday_snapshots_for_tickers(
     return mapped
 
 
+def calculate_intraday_quality_score(intraday: Dict[str, Any], signal: Dict[str, Any]) -> float:
+    """Score live confirmation quality from 0-100.
+
+    This is intentionally separate from the historical score so the API can show
+    whether a ticker is strong historically, strong intraday, or both.
+    """
+    change_pct = safe_float(intraday.get("intraday_change_pct"))
+    distance_from_high = safe_float(intraday.get("distance_from_high_pct"))
+    above_open = bool(intraday.get("above_open"))
+    above_vwap = bool(intraday.get("above_vwap"))
+
+    history = signal.get("history", {}) or {}
+    volume_anom = safe_float(history.get("volume_anomaly_ratio"), 1.0)
+
+    score = 50.0
+
+    # Positive intraday trend. Cap the contribution so one extreme move does not dominate.
+    score += min(max(change_pct, -5.0), 5.0) * 6.0
+
+    # Reward stocks holding close to high of day. distance_from_high is usually <= 0.
+    if distance_from_high >= -0.25:
+        score += 18
+    elif distance_from_high >= -0.50:
+        score += 14
+    elif distance_from_high >= -1.00:
+        score += 9
+    elif distance_from_high >= -2.00:
+        score += 4
+    else:
+        score -= min(abs(distance_from_high), 8.0) * 3.0
+
+    if above_open:
+        score += 8
+    else:
+        score -= 10
+
+    if above_vwap:
+        score += 10
+    else:
+        score -= 15
+
+    # Reuse historical volume anomaly until true intraday relative-volume is added.
+    if volume_anom >= 1.5:
+        score += 8
+    elif volume_anom >= 1.2:
+        score += 5
+    elif volume_anom < 0.75:
+        score -= 5
+
+    return clamp(score)
+
+
 def apply_intraday_confirmation(signal: Dict[str, Any], intraday: Dict[str, Any]) -> Dict[str, Any]:
+    original_score = safe_float(signal.get("overall_score"))
+
     if not intraday or intraday.get("error"):
         signal["intraday"] = intraday or {"error": "No intraday snapshot available"}
+        signal["historical_score"] = round(original_score, 1)
+        signal["intraday_quality_score"] = None
+        signal["intraday_score_adjustment"] = 0.0
         signal["intraday_confirmed"] = None
         signal["entry_status"] = "historical_only"
         signal["action"] = "wait_for_live_confirmation"
@@ -392,17 +449,29 @@ def apply_intraday_confirmation(signal: Dict[str, Any], intraday: Dict[str, Any]
     signal["intraday_confirmed"] = intraday.get("intraday_confirmed")
     signal["entry_status"] = intraday.get("entry_status")
     signal["action"] = "eligible_for_bullish_calls" if intraday.get("intraday_confirmed") else "watchlist_only"
+    signal["historical_score"] = round(original_score, 1)
+
+    intraday_quality = calculate_intraday_quality_score(intraday, signal)
+    signal["intraday_quality_score"] = round(intraday_quality, 1)
 
     if not intraday.get("intraday_confirmed"):
-        original_score = safe_float(signal.get("overall_score"))
         change_pct = safe_float(intraday.get("intraday_change_pct"))
-        penalty = 15.0
+        distance_from_high = safe_float(intraday.get("distance_from_high_pct"))
+
+        penalty = 12.0
+        if change_pct <= -0.5:
+            penalty = 18.0
         if change_pct <= -1.0:
             penalty = 25.0
         if change_pct <= -2.0:
             penalty = 35.0
+        if not intraday.get("above_vwap"):
+            penalty += 7.0
+        if distance_from_high < -3.0:
+            penalty += 5.0
+
         adjusted_score = clamp(original_score - penalty)
-        signal["historical_score"] = round(original_score, 1)
+        signal["intraday_score_adjustment"] = round(-penalty, 1)
         signal["overall_score"] = round(adjusted_score, 1)
         signal["setup"] = "historical bullish setup; intraday confirmation failed"
         signal["ideal_option_structure"] = "watchlist only; wait for reclaim before bullish calls"
@@ -410,8 +479,16 @@ def apply_intraday_confirmation(signal: Dict[str, Any], intraday: Dict[str, Any]
         signal["trade_plan"]["entry_rule"] = "Do not enter unless price reclaims intraday open/VWAP and turns positive on the day."
         signal["notes"].append(intraday.get("reason", "Failed bullish intraday confirmation."))
     else:
-        signal["historical_score"] = signal.get("overall_score")
-        signal["trade_plan"]["entry_rule"] = "Active only while intraday confirmation remains valid."
+        # Confirmed names get a modest boost based on live quality, not just a binary pass.
+        boost = max(0.0, (intraday_quality - 70.0) * 0.35)
+        boost = min(boost, 12.0)
+        adjusted_score = clamp(original_score + boost)
+
+        signal["intraday_score_adjustment"] = round(boost, 1)
+        signal["overall_score"] = round(adjusted_score, 1)
+        signal["trade_plan"]["entry_rule"] = "Active only while intraday confirmation remains valid. Prefer entries above VWAP and near high-of-day continuation."
+        signal["notes"].append("Live intraday confirmation boosted ranking quality.")
+
     return signal
 
 
@@ -853,7 +930,9 @@ async def build_signal_rows(req: SignalsRequest, universe: str) -> Dict[str, Any
     candidates.sort(
         key=lambda x: (
             1 if x.get("intraday_confirmed") is True else 0,
+            safe_float(x.get("intraday_quality_score")),
             x.get("overall_score", 0),
+            x.get("historical_score", 0),
         ),
         reverse=True,
     )
@@ -880,11 +959,11 @@ async def signals(req: SignalsRequest) -> Dict[str, Any]:
         "polygon_enabled": bool(POLYGON_API_KEY),
         "cache": cache_status(),
         "methodology": {
-            "version": "signals_v3_intraday_confirmation",
+            "version": "signals_v4_intraday_rank_boost",
             "inputs": [
                 "open", "high", "low", "close", "volume", "dollar volume",
                 "30 market days of grouped historical bars", "ATR(14)", "RSI(14)",
-                "SMA(5/10/20)", "5d momentum", "20d momentum", "volume anomaly", "live intraday snapshot", "intraday confirmation"
+                "SMA(5/10/20)", "5d momentum", "20d momentum", "volume anomaly", "live intraday snapshot", "intraday confirmation", "intraday ranking boost", "VWAP/HOD confirmation"
             ],
             "limitations": [
                 "No options chain, implied volatility, Greeks, earnings calendar, or live news yet.",
@@ -1079,11 +1158,11 @@ async def daily_report(req: DailyReportRequest) -> Dict[str, Any]:
         "polygon_enabled": bool(POLYGON_API_KEY),
         "cache": cache_status(),
         "methodology": {
-            "version": "signals_v3_intraday_confirmation",
+            "version": "signals_v4_intraday_rank_boost",
             "inputs": [
                 "open", "high", "low", "close", "volume", "dollar volume",
                 "30 market days of grouped historical bars", "ATR(14)", "RSI(14)",
-                "SMA(5/10/20)", "5d momentum", "20d momentum", "volume anomaly", "live intraday snapshot", "intraday confirmation"
+                "SMA(5/10/20)", "5d momentum", "20d momentum", "volume anomaly", "live intraday snapshot", "intraday confirmation", "intraday ranking boost", "VWAP/HOD confirmation"
             ],
             "limitations": [
                 "No options chain, implied volatility, Greeks, earnings calendar, or live news yet.",
