@@ -971,9 +971,7 @@ async def signals(req: SignalsRequest) -> Dict[str, Any]:
             "inputs": [
                 "open", "high", "low", "close", "volume", "dollar volume",
                 "30 market days of grouped historical bars", "ATR(14)", "RSI(14)",
-                "SMA(5/10/20)", "5d momentum", "20d momentum", "volume anomaly",
-                "live intraday snapshot", "intraday confirmation", "intraday ranking boost",
-                "VWAP/HOD confirmation", "recommendation tracking", "target-before-stop grading"
+                "SMA(5/10/20)", "5d momentum", "20d momentum", "volume anomaly", "live intraday snapshot", "intraday confirmation", "intraday ranking boost", "VWAP/HOD confirmation", "recommendation tracking", "target-before-stop grading"
             ],
             "limitations": [
                 "No options chain, implied volatility, Greeks, earnings calendar, or live news yet.",
@@ -986,6 +984,327 @@ async def signals(req: SignalsRequest) -> Dict[str, Any]:
     payload["tracking"] = track_signal_recommendations(payload)
     return payload
 
+
+
+# -------------------------
+# Feedback / performance tracking
+# -------------------------
+
+def ensure_data_dir() -> None:
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+
+
+def load_tracked_signals() -> List[Dict[str, Any]]:
+    ensure_data_dir()
+    if not TRACKED_SIGNALS_FILE.exists():
+        return []
+    try:
+        with TRACKED_SIGNALS_FILE.open("r", encoding="utf-8") as f:
+            raw = json.load(f)
+        return raw if isinstance(raw, list) else []
+    except Exception:
+        return []
+
+
+def save_tracked_signals(records: List[Dict[str, Any]]) -> None:
+    ensure_data_dir()
+    tmp = TRACKED_SIGNALS_FILE.with_suffix(".tmp")
+    with tmp.open("w", encoding="utf-8") as f:
+        json.dump(records, f, indent=2, default=str)
+    tmp.replace(TRACKED_SIGNALS_FILE)
+
+
+def tracking_key(record: Dict[str, Any]) -> str:
+    return "|".join([
+        str(record.get("created_date", "")),
+        str(record.get("ticker", "")),
+        str(record.get("entry", "")),
+        str(record.get("stop", "")),
+        str(record.get("target_1", "")),
+    ])
+
+
+def signal_to_tracking_record(sig: Dict[str, Any], universe: str, horizon: str, rank: int) -> Dict[str, Any]:
+    trade = sig.get("trade_plan", {}) or {}
+    hist = sig.get("history", {}) or {}
+    intra = sig.get("intraday", {}) or {}
+    now = datetime.now(timezone.utc)
+    return {
+        "id": str(uuid4()),
+        "created_at": now.isoformat(),
+        "created_date": now.date().isoformat(),
+        "universe": universe,
+        "horizon": horizon,
+        "rank": rank,
+        "ticker": sig.get("ticker"),
+        "setup": sig.get("setup"),
+        "risk_profile": sig.get("risk_profile"),
+        "entry_status": sig.get("entry_status"),
+        "action": sig.get("action"),
+        "entry": safe_float(trade.get("entry")),
+        "stop": safe_float(trade.get("stop")),
+        "target_1": safe_float(trade.get("target_1")),
+        "target_2": safe_float(trade.get("target_2")),
+        "historical_score": safe_float(sig.get("historical_score", sig.get("overall_score"))),
+        "overall_score": safe_float(sig.get("overall_score")),
+        "intraday_quality_score": safe_float(sig.get("intraday_quality_score")),
+        "intraday_score_adjustment": safe_float(sig.get("intraday_score_adjustment")),
+        "rsi14": hist.get("rsi14"),
+        "atr14": hist.get("atr14"),
+        "momentum_5d_pct": hist.get("momentum_5d_pct"),
+        "momentum_20d_pct": hist.get("momentum_20d_pct"),
+        "volume_anomaly_ratio": hist.get("volume_anomaly_ratio"),
+        "intraday_change_pct": intra.get("intraday_change_pct"),
+        "above_vwap": intra.get("above_vwap"),
+        "distance_from_high_pct": intra.get("distance_from_high_pct"),
+        "status": "open",
+        "outcome": "no_hit_yet",
+        "first_hit": None,
+        "target_hit_at": None,
+        "stop_hit_at": None,
+        "target_hit_after_stop": False,
+        "max_gain_pct": None,
+        "max_drawdown_pct": None,
+        "last_evaluated_at": None,
+        "evaluation_days": 0,
+        "bars_checked": 0,
+        "notes": [],
+    }
+
+
+def track_signal_recommendations(payload: Dict[str, Any]) -> Dict[str, Any]:
+    records = load_tracked_signals()
+    existing = {tracking_key(r) for r in records}
+    added = 0
+
+    for universe_block in payload.get("universes", []):
+        universe = universe_block.get("universe")
+        for rank, sig in enumerate((universe_block.get("signals") or [])[:TRACKING_TOP_N], start=1):
+            record = signal_to_tracking_record(sig, universe, payload.get("horizon", "1d"), rank)
+            key = tracking_key(record)
+            if key not in existing:
+                records.append(record)
+                existing.add(key)
+                added += 1
+
+    cutoff = datetime.now(timezone.utc) - timedelta(days=730)
+    cleaned = []
+    for r in records:
+        try:
+            created = datetime.fromisoformat(str(r.get("created_at")).replace("Z", "+00:00"))
+        except Exception:
+            created = datetime.now(timezone.utc)
+        if r.get("status") != "closed" or created >= cutoff:
+            cleaned.append(r)
+
+    save_tracked_signals(cleaned)
+    return {"tracked_total": len(cleaned), "tracked_added": added}
+
+
+async def fetch_daily_bars_for_tracking(client: httpx.AsyncClient, ticker: str, from_date: str, to_date: str) -> List[Dict[str, Any]]:
+    if not POLYGON_API_KEY:
+        return []
+    url = f"https://api.polygon.io/v2/aggs/ticker/{polygon_stock_key(ticker)}/range/1/day/{from_date}/{to_date}"
+    params = {"adjusted": "true", "sort": "asc", "limit": 5000, "apiKey": POLYGON_API_KEY}
+    try:
+        resp = await client.get(url, params=params)
+        if resp.status_code != 200:
+            return []
+        rows = resp.json().get("results") or []
+    except Exception:
+        return []
+
+    bars: List[Dict[str, Any]] = []
+    for r in rows:
+        ts = r.get("t")
+        try:
+            date = datetime.fromtimestamp(ts / 1000, timezone.utc).date().isoformat() if ts else None
+        except Exception:
+            date = None
+        bars.append({
+            "date": date,
+            "open": safe_float(r.get("o")),
+            "high": safe_float(r.get("h")),
+            "low": safe_float(r.get("l")),
+            "close": safe_float(r.get("c")),
+            "volume": safe_float(r.get("v")),
+        })
+    return bars
+
+
+def grade_record_with_bars(record: Dict[str, Any], bars: List[Dict[str, Any]]) -> Dict[str, Any]:
+    entry = safe_float(record.get("entry"))
+    stop = safe_float(record.get("stop"))
+    target = safe_float(record.get("target_1"))
+    if entry <= 0 or stop <= 0 or target <= 0:
+        record["outcome"] = "cannot_grade_missing_levels"
+        return record
+
+    first_hit = record.get("first_hit")
+    stop_hit_at = record.get("stop_hit_at")
+    target_hit_at = record.get("target_hit_at")
+    max_high = entry
+    min_low = entry
+    bars_checked = 0
+
+    for bar in bars:
+        high = safe_float(bar.get("high"))
+        low = safe_float(bar.get("low"))
+        date = bar.get("date")
+        if high <= 0 or low <= 0:
+            continue
+        bars_checked += 1
+        max_high = max(max_high, high)
+        min_low = min(min_low, low)
+        hit_target = high >= target
+        hit_stop = low <= stop
+
+        if hit_target and not target_hit_at:
+            target_hit_at = date
+        if hit_stop and not stop_hit_at:
+            stop_hit_at = date
+
+        # With daily bars, same-day order is unknown if both levels hit.
+        if not first_hit:
+            if hit_target and hit_stop:
+                first_hit = "ambiguous_same_day"
+            elif hit_target:
+                first_hit = "target"
+            elif hit_stop:
+                first_hit = "stop"
+
+    record["bars_checked"] = bars_checked
+    record["max_gain_pct"] = round(((max_high - entry) / entry) * 100, 2)
+    record["max_drawdown_pct"] = round(((min_low - entry) / entry) * 100, 2)
+    record["target_hit_at"] = target_hit_at
+    record["stop_hit_at"] = stop_hit_at
+    record["first_hit"] = first_hit
+    record["target_hit_after_stop"] = bool(target_hit_at and stop_hit_at and first_hit == "stop")
+
+    if first_hit == "target":
+        record["status"] = "closed"
+        record["outcome"] = "clean_win_target_before_stop"
+    elif first_hit == "ambiguous_same_day":
+        record["status"] = "closed"
+        record["outcome"] = "ambiguous_target_and_stop_same_day"
+    elif first_hit == "stop" and target_hit_at:
+        record["status"] = "closed"
+        record["outcome"] = "messy_win_target_after_stop"
+    elif first_hit == "stop":
+        record["status"] = "open_after_stop"
+        record["outcome"] = "stop_hit_first_monitoring_for_later_target"
+    else:
+        record["status"] = "open"
+        record["outcome"] = "no_hit_yet"
+
+    try:
+        created = datetime.fromisoformat(str(record.get("created_at")).replace("Z", "+00:00"))
+        record["evaluation_days"] = (datetime.now(timezone.utc).date() - created.date()).days
+    except Exception:
+        record["evaluation_days"] = None
+
+    if record.get("evaluation_days") is not None and record["evaluation_days"] >= TRACKING_MAX_DAYS and record["status"] in {"open", "open_after_stop"}:
+        record["status"] = "closed"
+        record["outcome"] = "loss_stop_before_target" if first_hit == "stop" else "expired_no_target_or_stop"
+
+    record["last_evaluated_at"] = datetime.now(timezone.utc).isoformat()
+    return record
+
+
+async def evaluate_tracked_signals() -> Dict[str, Any]:
+    records = load_tracked_signals()
+    if not records:
+        return build_performance_summary(records, updated=0)
+
+    updated = 0
+    today = datetime.now(timezone.utc).date()
+    timeout = httpx.Timeout(connect=10.0, read=25.0, write=10.0, pool=25.0)
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        for record in records:
+            if record.get("status") == "closed":
+                continue
+            ticker = str(record.get("ticker") or "").upper()
+            if not ticker:
+                continue
+            try:
+                created = datetime.fromisoformat(str(record.get("created_at")).replace("Z", "+00:00")).date()
+            except Exception:
+                continue
+            bars = await fetch_daily_bars_for_tracking(client, ticker, created.isoformat(), today.isoformat())
+            if not bars:
+                continue
+            before = json.dumps(record, sort_keys=True, default=str)
+            grade_record_with_bars(record, bars)
+            after = json.dumps(record, sort_keys=True, default=str)
+            if before != after:
+                updated += 1
+            await asyncio.sleep(0.05)
+
+    save_tracked_signals(records)
+    return build_performance_summary(records, updated=updated)
+
+
+def build_performance_summary(records: List[Dict[str, Any]], updated: int = 0) -> Dict[str, Any]:
+    closed = [r for r in records if r.get("status") == "closed"]
+    open_records = [r for r in records if r.get("status") != "closed"]
+    clean = [r for r in closed if r.get("outcome") == "clean_win_target_before_stop"]
+    messy = [r for r in closed if r.get("outcome") == "messy_win_target_after_stop"]
+    ambiguous = [r for r in closed if r.get("outcome") == "ambiguous_target_and_stop_same_day"]
+    losses = [r for r in closed if r.get("outcome") == "loss_stop_before_target"]
+    expired = [r for r in closed if r.get("outcome") == "expired_no_target_or_stop"]
+    total = len(closed)
+    clean_rate = round(len(clean) / total * 100, 1) if total else None
+    any_target_rate = round((len(clean) + len(messy) + len(ambiguous)) / total * 100, 1) if total else None
+
+    def avg(field: str):
+        vals = [safe_float(r.get(field)) for r in closed if r.get(field) is not None]
+        return round(sum(vals) / len(vals), 2) if vals else None
+
+    def group_by(field: str) -> List[Dict[str, Any]]:
+        groups: Dict[str, List[Dict[str, Any]]] = {}
+        for r in closed:
+            groups.setdefault(str(r.get(field) or "unknown"), []).append(r)
+        output = []
+        for name, rows in sorted(groups.items(), key=lambda kv: len(kv[1]), reverse=True):
+            cw = sum(1 for r in rows if r.get("outcome") == "clean_win_target_before_stop")
+            at = sum(1 for r in rows if r.get("outcome") in {"clean_win_target_before_stop", "messy_win_target_after_stop", "ambiguous_target_and_stop_same_day"})
+            output.append({
+                field: name,
+                "closed": len(rows),
+                "clean_wins": cw,
+                "clean_win_rate_pct": round(cw / len(rows) * 100, 1) if rows else None,
+                "any_target_rate_pct": round(at / len(rows) * 100, 1) if rows else None,
+            })
+        return output[:10]
+
+    return {
+        "tracked_total": len(records),
+        "updated": updated,
+        "closed_total": total,
+        "open_total": len(open_records),
+        "clean_wins": len(clean),
+        "messy_wins_target_after_stop": len(messy),
+        "ambiguous_target_and_stop_same_day": len(ambiguous),
+        "losses_stop_before_target": len(losses),
+        "expired_no_target_or_stop": len(expired),
+        "clean_win_rate_pct": clean_rate,
+        "any_target_rate_pct": any_target_rate,
+        "avg_max_gain_pct": avg("max_gain_pct"),
+        "avg_max_drawdown_pct": avg("max_drawdown_pct"),
+        "by_setup": group_by("setup"),
+        "by_entry_status": group_by("entry_status"),
+        "by_risk_profile": group_by("risk_profile"),
+        "recent_closed": closed[-10:],
+        "recent_open": open_records[-10:],
+    }
+
+
+@app.post("/performance")
+async def performance() -> Dict[str, Any]:
+    return await evaluate_tracked_signals()
 
 
 class DailyReportRequest(BaseModel):
@@ -1119,17 +1438,6 @@ def signal_report_html(payload: Dict[str, Any]) -> str:
         <p><strong>Cache fresh:</strong> {esc(cache.get('fresh'))} | <strong>History tickers:</strong> {esc(cache.get('history_ticker_count'))}</p>
         <p><strong>Methodology:</strong> {esc(methodology.get('version'))}</p>
       </div>
-      <div class="card">
-        <h2>Performance Feedback</h2>
-        <p><strong>Tracked:</strong> {esc((payload.get('performance') or {}).get('tracked_total'))}
-        | <strong>Closed:</strong> {esc((payload.get('performance') or {}).get('closed_total'))}
-        | <strong>Open:</strong> {esc((payload.get('performance') or {}).get('open_total'))}</p>
-        <p><strong>Clean win rate:</strong> {esc((payload.get('performance') or {}).get('clean_win_rate_pct'))}%
-        | <strong>Any target rate:</strong> {esc((payload.get('performance') or {}).get('any_target_rate_pct'))}%</p>
-        <p><strong>Clean wins:</strong> {esc((payload.get('performance') or {}).get('clean_wins'))}
-        | <strong>Messy wins after stop:</strong> {esc((payload.get('performance') or {}).get('messy_wins_target_after_stop'))}
-        | <strong>Losses:</strong> {esc((payload.get('performance') or {}).get('losses_stop_before_target'))}</p>
-      </div>
       {''.join(rows_html)}
       <div class="card">
         <h2>System Notes</h2>
@@ -1205,6 +1513,7 @@ async def daily_report(req: DailyReportRequest) -> Dict[str, Any]:
         },
         "universes": [await build_signal_rows(signals_req, universe) for universe in universes],
     }
+
     payload["tracking"] = track_signal_recommendations(payload)
 
     subject_date = payload.get("cache", {}).get("market_date") or datetime.now(timezone.utc).date().isoformat()
