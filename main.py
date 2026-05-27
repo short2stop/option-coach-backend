@@ -38,6 +38,7 @@ CACHE: Dict[str, Any] = {
     "stock_rows": {},
     "crypto_rows": {},
     "history_rows": {},
+    "intraday_rows": {},
     "errors": [],
 }
 
@@ -280,6 +281,7 @@ async def fetch_polygon_crypto_one(client: httpx.AsyncClient, symbol: str) -> Di
         return {"ticker": ticker, "error": f"Polygon crypto request failed: {e}"}
 
 
+
 async def fetch_intraday_snapshot(
     client: httpx.AsyncClient,
     ticker: str,
@@ -360,6 +362,7 @@ async def fetch_intraday_snapshot(
             "ticker": ticker,
             "error": str(e)
         }
+
 
 async def fetch_crypto_rows(client: httpx.AsyncClient) -> Dict[str, Dict[str, Any]]:
     crypto_tickers = INDEX_MAP.get("crypto", [])
