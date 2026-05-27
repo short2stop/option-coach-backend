@@ -286,28 +286,19 @@ async def fetch_intraday_snapshot(
     client: httpx.AsyncClient,
     ticker: str,
 ) -> Dict[str, Any]:
-
     if not POLYGON_API_KEY:
         return {"ticker": ticker, "error": "Polygon API key missing"}
 
     url = f"https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/tickers/{ticker}"
-
-    params = {
-        "apiKey": POLYGON_API_KEY
-    }
+    params = {"apiKey": POLYGON_API_KEY}
 
     try:
         resp = await client.get(url, params=params)
-
         if resp.status_code != 200:
-            return {
-                "ticker": ticker,
-                "error": f"Snapshot HTTP {resp.status_code}"
-            }
+            return {"ticker": ticker, "error": f"Snapshot HTTP {resp.status_code}: {resp.text[:200]}"}
 
         data = resp.json()
         ticker_data = data.get("ticker", {})
-
         day = ticker_data.get("day", {})
         prev_day = ticker_data.get("prevDay", {})
 
@@ -315,25 +306,28 @@ async def fetch_intraday_snapshot(
         open_price = safe_float(day.get("o"))
         high_price = safe_float(day.get("h"))
         low_price = safe_float(day.get("l"))
-
+        volume = safe_float(day.get("v"))
+        day_vwap = safe_float(day.get("vw"))
         prev_close = safe_float(prev_day.get("c"))
-
-        intraday_change_pct = safe_float(
-            ticker_data.get("todaysChangePerc")
-        )
+        intraday_change_pct = safe_float(ticker_data.get("todaysChangePerc"))
 
         distance_from_high_pct = 0.0
+        if high_price > 0 and current_price > 0:
+            distance_from_high_pct = ((current_price - high_price) / high_price) * 100
 
-        if high_price > 0:
-            distance_from_high_pct = (
-                (current_price - high_price) / high_price
-            ) * 100
+        above_open = bool(current_price and open_price and current_price >= open_price)
+        above_vwap = bool(current_price and day_vwap and current_price >= day_vwap)
+        intraday_confirmed = intraday_change_pct > 0 and above_open and distance_from_high_pct > -2.0
 
-        intraday_confirmed = (
-            intraday_change_pct > 0
-            and current_price >= open_price
-            and distance_from_high_pct > -2.0
-        )
+        if intraday_confirmed:
+            entry_status = "active_candidate"
+            reason = "Bullish intraday confirmation passed"
+        elif intraday_change_pct <= -1.0:
+            entry_status = "exclude_from_aggressive_calls"
+            reason = "Stock is down more than 1% intraday; do not chase bullish calls"
+        else:
+            entry_status = "watchlist_only"
+            reason = "Bullish setup has not confirmed intraday"
 
         return {
             "ticker": ticker,
@@ -341,27 +335,84 @@ async def fetch_intraday_snapshot(
             "open": round(open_price, 2),
             "high": round(high_price, 2),
             "low": round(low_price, 2),
+            "volume": round(volume, 0),
+            "day_vwap": round(day_vwap, 2),
             "prev_close": round(prev_close, 2),
             "intraday_change_pct": round(intraday_change_pct, 2),
             "distance_from_high_pct": round(distance_from_high_pct, 2),
+            "above_open": above_open,
+            "above_vwap": above_vwap,
             "intraday_confirmed": intraday_confirmed,
-            "entry_status": (
-                "active_candidate"
-                if intraday_confirmed
-                else "watchlist_only"
-            ),
-            "reason": (
-                "Bullish intraday confirmation passed"
-                if intraday_confirmed
-                else "Bullish setup failed intraday confirmation"
-            ),
+            "entry_status": entry_status,
+            "reason": reason,
         }
-
     except Exception as e:
-        return {
-            "ticker": ticker,
-            "error": str(e)
-        }
+        return {"ticker": ticker, "error": str(e)}
+
+
+async def fetch_intraday_snapshots_for_tickers(
+    tickers: List[str],
+    max_concurrency: int = 8,
+) -> Dict[str, Dict[str, Any]]:
+    if not tickers:
+        return {}
+
+    timeout = httpx.Timeout(connect=10.0, read=25.0, write=10.0, pool=25.0)
+    semaphore = asyncio.Semaphore(max_concurrency)
+
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        async def fetch_one(ticker: str) -> tuple[str, Dict[str, Any]]:
+            async with semaphore:
+                result = await fetch_intraday_snapshot(client, ticker)
+                await asyncio.sleep(0.05)
+                return ticker, result
+
+        tasks = [fetch_one(t) for t in tickers]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    mapped: Dict[str, Dict[str, Any]] = {}
+    for item in results:
+        if isinstance(item, Exception):
+            continue
+        ticker, result = item
+        mapped[ticker] = result
+    return mapped
+
+
+def apply_intraday_confirmation(signal: Dict[str, Any], intraday: Dict[str, Any]) -> Dict[str, Any]:
+    if not intraday or intraday.get("error"):
+        signal["intraday"] = intraday or {"error": "No intraday snapshot available"}
+        signal["intraday_confirmed"] = None
+        signal["entry_status"] = "historical_only"
+        signal["action"] = "wait_for_live_confirmation"
+        signal["notes"].append("No live intraday confirmation was available; treat as historical setup only.")
+        return signal
+
+    signal["intraday"] = intraday
+    signal["intraday_confirmed"] = intraday.get("intraday_confirmed")
+    signal["entry_status"] = intraday.get("entry_status")
+    signal["action"] = "eligible_for_bullish_calls" if intraday.get("intraday_confirmed") else "watchlist_only"
+
+    if not intraday.get("intraday_confirmed"):
+        original_score = safe_float(signal.get("overall_score"))
+        change_pct = safe_float(intraday.get("intraday_change_pct"))
+        penalty = 15.0
+        if change_pct <= -1.0:
+            penalty = 25.0
+        if change_pct <= -2.0:
+            penalty = 35.0
+        adjusted_score = clamp(original_score - penalty)
+        signal["historical_score"] = round(original_score, 1)
+        signal["overall_score"] = round(adjusted_score, 1)
+        signal["setup"] = "historical bullish setup; intraday confirmation failed"
+        signal["ideal_option_structure"] = "watchlist only; wait for reclaim before bullish calls"
+        signal["trade_plan"]["bias"] = "watchlist_only"
+        signal["trade_plan"]["entry_rule"] = "Do not enter unless price reclaims intraday open/VWAP and turns positive on the day."
+        signal["notes"].append(intraday.get("reason", "Failed bullish intraday confirmation."))
+    else:
+        signal["historical_score"] = signal.get("overall_score")
+        signal["trade_plan"]["entry_rule"] = "Active only while intraday confirmation remains valid."
+    return signal
 
 
 async def fetch_crypto_rows(client: httpx.AsyncClient) -> Dict[str, Dict[str, Any]]:
@@ -659,7 +710,7 @@ def rsi_score(rsi: Optional[float]) -> float:
         return 40.0
     return 25.0
 
-def build_signal_rows(req: SignalsRequest, universe: str) -> Dict[str, Any]:
+async def build_signal_rows(req: SignalsRequest, universe: str) -> Dict[str, Any]:
     screen_req = ScreenRequest(
         universe=universe, horizon=req.horizon, tickers=req.tickers, refresh=False
     )
@@ -677,6 +728,14 @@ def build_signal_rows(req: SignalsRequest, universe: str) -> Dict[str, Any]:
         if close < req.min_price or volume < req.min_volume or open_ <= 0 or high <= 0 or low <= 0:
             continue
         valid_rows.append(row)
+
+    snapshot_tickers = [
+        str(r.get("requested_ticker") or r.get("ticker") or "").upper()
+        for r in valid_rows
+        if str(r.get("requested_ticker") or r.get("ticker") or "").upper()
+    ]
+    intraday_rows = await fetch_intraday_snapshots_for_tickers(snapshot_tickers)
+    CACHE["intraday_rows"] = intraday_rows
 
     volumes = [safe_float(r.get("volume")) for r in valid_rows]
     dollar_volumes = [safe_float(r.get("close")) * safe_float(r.get("volume")) for r in valid_rows]
@@ -740,8 +799,7 @@ def build_signal_rows(req: SignalsRequest, universe: str) -> Dict[str, Any]:
         target_2 = round(close + risk_per_share * 2.5, 2)
         reward_risk = round((target_2 - entry) / max(entry - stop, 0.01), 2)
 
-        candidates.append(
-            {
+        signal = {
                 "ticker": ticker,
                 "asset_type": row.get("asset_type"),
                 "source": row.get("source"),
@@ -788,9 +846,17 @@ def build_signal_rows(req: SignalsRequest, universe: str) -> Dict[str, Any]:
                     "Stops/targets use ATR(14) when available; otherwise a range-based fallback is used.",
                 ],
             }
-        )
 
-    candidates.sort(key=lambda x: x.get("overall_score", 0), reverse=True)
+        signal = apply_intraday_confirmation(signal, intraday_rows.get(ticker, {}))
+        candidates.append(signal)
+
+    candidates.sort(
+        key=lambda x: (
+            1 if x.get("intraday_confirmed") is True else 0,
+            x.get("overall_score", 0),
+        ),
+        reverse=True,
+    )
     return {
         "universe": universe,
         "candidate_count": len(candidates),
@@ -814,18 +880,18 @@ async def signals(req: SignalsRequest) -> Dict[str, Any]:
         "polygon_enabled": bool(POLYGON_API_KEY),
         "cache": cache_status(),
         "methodology": {
-            "version": "signals_v2_history",
+            "version": "signals_v3_intraday_confirmation",
             "inputs": [
                 "open", "high", "low", "close", "volume", "dollar volume",
                 "30 market days of grouped historical bars", "ATR(14)", "RSI(14)",
-                "SMA(5/10/20)", "5d momentum", "20d momentum", "volume anomaly"
+                "SMA(5/10/20)", "5d momentum", "20d momentum", "volume anomaly", "live intraday snapshot", "intraday confirmation"
             ],
             "limitations": [
                 "No options chain, implied volatility, Greeks, earnings calendar, or live news yet.",
                 "Option structures are inferred from underlying behavior until options-chain data is added.",
             ],
         },
-        "universes": [build_signal_rows(req, universe) for universe in universes],
+        "universes": [await build_signal_rows(req, universe) for universe in universes],
     }
 
 
@@ -1013,18 +1079,18 @@ async def daily_report(req: DailyReportRequest) -> Dict[str, Any]:
         "polygon_enabled": bool(POLYGON_API_KEY),
         "cache": cache_status(),
         "methodology": {
-            "version": "signals_v2_history",
+            "version": "signals_v3_intraday_confirmation",
             "inputs": [
                 "open", "high", "low", "close", "volume", "dollar volume",
                 "30 market days of grouped historical bars", "ATR(14)", "RSI(14)",
-                "SMA(5/10/20)", "5d momentum", "20d momentum", "volume anomaly"
+                "SMA(5/10/20)", "5d momentum", "20d momentum", "volume anomaly", "live intraday snapshot", "intraday confirmation"
             ],
             "limitations": [
                 "No options chain, implied volatility, Greeks, earnings calendar, or live news yet.",
                 "Option structures are inferred from underlying behavior until options-chain data is added.",
             ],
         },
-        "universes": [build_signal_rows(signals_req, universe) for universe in universes],
+        "universes": [await build_signal_rows(signals_req, universe) for universe in universes],
     }
 
     subject_date = payload.get("cache", {}).get("market_date") or datetime.now(timezone.utc).date().isoformat()
