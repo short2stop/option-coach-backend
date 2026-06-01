@@ -71,7 +71,7 @@ INDEX_MAP = load_constituents()
 
 
 class ScreenRequest(BaseModel):
-    universe: Literal["sp500", "dow30", "nasdaq100", "russell2000", "crypto", "all"]
+    universe: Literal["sp500", "dow30", "nasdaq100", "russell2000", "crypto", "watchlist", "all"]
     horizon: Literal["1d", "1w", "1mo"] = "1d"
     tickers: Optional[List[str]] = Field(default=None, description="Optional explicit ticker list")
     refresh: bool = Field(default=False, description="Force a cache refresh before returning data")
@@ -628,7 +628,7 @@ async def screen(req: ScreenRequest) -> Dict[str, Any]:
 
 
 class SignalsRequest(BaseModel):
-    universe: Literal["sp500", "dow30", "nasdaq100", "russell2000", "crypto", "all"] = "sp500"
+    universe: Literal["sp500", "dow30", "nasdaq100", "russell2000", "crypto", "watchlist", "all"] = "sp500"
     horizon: Literal["1d", "1w", "1mo"] = "1d"
     tickers: Optional[List[str]] = Field(default=None, description="Optional explicit ticker list")
     refresh: bool = Field(default=False, description="Force a cache refresh before returning signals")
@@ -1308,7 +1308,7 @@ async def performance() -> Dict[str, Any]:
 
 
 class DailyReportRequest(BaseModel):
-    universe: Literal["sp500", "dow30", "nasdaq100", "russell2000", "crypto", "all"] = "sp500"
+    universe: Literal["sp500", "dow30", "nasdaq100", "russell2000", "crypto", "watchlist", "all"] = "sp500"
     horizon: Literal["1d", "1w", "1mo"] = "1d"
     limit: int = Field(default=10, ge=1, le=25, description="Number of ranked setups to include in the email")
     refresh: bool = Field(default=False, description="Refresh cache before building the report")
