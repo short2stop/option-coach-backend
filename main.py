@@ -22,7 +22,7 @@ POLYGON_API_KEY = os.getenv("POLYGON_API_KEY", "").strip()
 POLYGON_BASE = "https://api.polygon.io/v2"
 CONSTITUENTS_FILE = Path(__file__).with_name("constituents.json")
 
-ALL_UNIVERSES = ["sp500", "dow30", "nasdaq100", "russell2000", "crypto"]
+ALL_UNIVERSES = ["sp500", "dow30", "nasdaq100", "russell2000", "crypto", "watchlist"]
 CACHE_MAX_AGE_SECONDS = int(os.getenv("OPTION_COACH_CACHE_SECONDS", str(60 * 60 * 12)))
 
 DATA_DIR = Path(os.getenv("OPTION_COACH_DATA_DIR", "/var/data"))
