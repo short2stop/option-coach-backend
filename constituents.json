@@ -47,5 +47,9 @@
   "crypto": [
     "BTCUSD","ETHUSD","SOLUSD","ADAUSD","XRPUSD",
     "DOGEUSD","MATICUSD","LTCUSD","DOTUSD","AVAXUSD"
+  ],
+  "watchlist": [
+    "KRKNF",
+    "DFLI"
   ]
 }
