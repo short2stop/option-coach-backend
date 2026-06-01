@@ -71,7 +71,7 @@ INDEX_MAP = load_constituents()
 
 
 class ScreenRequest(BaseModel):
-    universe: Literal["sp500", "dow30", "nasdaq100", "russell2000", "crypto", "watchlist", "all"]
+    universe: Literal["sp500", "dow30", "nasdaq100", "russell2000", "crypto", "all"]
     horizon: Literal["1d", "1w", "1mo"] = "1d"
     tickers: Optional[List[str]] = Field(default=None, description="Optional explicit ticker list")
     refresh: bool = Field(default=False, description="Force a cache refresh before returning data")
@@ -437,6 +437,69 @@ def calculate_intraday_quality_score(intraday: Dict[str, Any], signal: Dict[str,
     return clamp(score)
 
 
+
+def recalculate_trade_plan_from_live_price(signal: Dict[str, Any], intraday: Dict[str, Any]) -> Dict[str, Any]:
+    """Recalculate entry, stop, and targets from live intraday price."""
+    trade = signal.get("trade_plan", {}) or {}
+    history = signal.get("history", {}) or {}
+
+    old_entry = safe_float(trade.get("entry"))
+    live_price = safe_float(intraday.get("current_price"))
+
+    if live_price <= 0:
+        signal["live_price_used_for_trade_plan"] = False
+        signal["stale_entry_warning"] = True
+        signal["stale_entry_reason"] = "No valid live current_price was available; trade_plan still uses historical close."
+        return signal
+
+    atr14 = safe_float(history.get("atr14"))
+    day_high = safe_float(intraday.get("high"))
+    day_low = safe_float(intraday.get("low"))
+    day_range = max(day_high - day_low, 0.0)
+
+    risk_unit = atr14 if atr14 > 0 else max(day_range * 0.75, live_price * 0.015)
+    risk_per_share = max(risk_unit * 0.75, live_price * 0.01)
+
+    new_entry = round(live_price, 2)
+    new_stop = round(max(live_price - risk_per_share, 0.01), 2)
+    new_target_1 = round(live_price + risk_per_share * 1.5, 2)
+    new_target_2 = round(live_price + risk_per_share * 2.5, 2)
+    new_reward_risk = round((new_target_2 - new_entry) / max(new_entry - new_stop, 0.01), 2)
+
+    stale_entry_diff_pct = None
+    stale_entry_warning = False
+
+    if old_entry > 0:
+        stale_entry_diff_pct = ((live_price - old_entry) / old_entry) * 100
+        stale_entry_warning = abs(stale_entry_diff_pct) >= 1.0
+
+    signal["historical_trade_plan"] = dict(trade)
+    signal["live_price_used_for_trade_plan"] = True
+    signal["stale_entry_warning"] = stale_entry_warning
+    signal["stale_entry_diff_pct"] = round(stale_entry_diff_pct, 2) if stale_entry_diff_pct is not None else None
+
+    if stale_entry_warning:
+        signal["stale_entry_reason"] = (
+            "Historical entry differed from live current price by more than 1%; "
+            "entry/stop/targets were recalculated from live price."
+        )
+    else:
+        signal["stale_entry_reason"] = None
+
+    trade["entry"] = new_entry
+    trade["stop"] = new_stop
+    trade["target_1"] = new_target_1
+    trade["target_2"] = new_target_2
+    trade["risk_per_share"] = round(new_entry - new_stop, 2)
+    trade["reward_risk_to_target_2"] = new_reward_risk
+    trade["invalidates_below"] = new_stop
+    trade["entry_basis"] = "live_intraday_current_price"
+    trade["previous_historical_entry"] = round(old_entry, 2) if old_entry > 0 else None
+
+    signal["trade_plan"] = trade
+    return signal
+
+
 def apply_intraday_confirmation(signal: Dict[str, Any], intraday: Dict[str, Any]) -> Dict[str, Any]:
     original_score = safe_float(signal.get("overall_score"))
 
@@ -452,6 +515,7 @@ def apply_intraday_confirmation(signal: Dict[str, Any], intraday: Dict[str, Any]
         return signal
 
     signal["intraday"] = intraday
+    signal = recalculate_trade_plan_from_live_price(signal, intraday)
     signal["intraday_confirmed"] = intraday.get("intraday_confirmed")
     signal["entry_status"] = intraday.get("entry_status")
     signal["action"] = "eligible_for_bullish_calls" if intraday.get("intraday_confirmed") else "watchlist_only"
@@ -628,7 +692,7 @@ async def screen(req: ScreenRequest) -> Dict[str, Any]:
 
 
 class SignalsRequest(BaseModel):
-    universe: Literal["sp500", "dow30", "nasdaq100", "russell2000", "crypto", "watchlist", "all"] = "sp500"
+    universe: Literal["sp500", "dow30", "nasdaq100", "russell2000", "crypto", "all"] = "sp500"
     horizon: Literal["1d", "1w", "1mo"] = "1d"
     tickers: Optional[List[str]] = Field(default=None, description="Optional explicit ticker list")
     refresh: bool = Field(default=False, description="Force a cache refresh before returning signals")
@@ -967,16 +1031,17 @@ async def signals(req: SignalsRequest) -> Dict[str, Any]:
         "polygon_enabled": bool(POLYGON_API_KEY),
         "cache": cache_status(),
         "methodology": {
-            "version": "signals_v5_feedback_tracking",
+            "version": "signals_v6_live_trade_plan",
             "inputs": [
                 "open", "high", "low", "close", "volume", "dollar volume",
                 "30 market days of grouped historical bars", "ATR(14)", "RSI(14)",
-                "SMA(5/10/20)", "5d momentum", "20d momentum", "volume anomaly", "live intraday snapshot", "intraday confirmation", "intraday ranking boost", "VWAP/HOD confirmation", "recommendation tracking", "target-before-stop grading"
+                "SMA(5/10/20)", "5d momentum", "20d momentum", "volume anomaly", "live intraday snapshot", "intraday confirmation", "intraday ranking boost", "VWAP/HOD confirmation", "recommendation tracking", "target-before-stop grading", "live-price entry recalculation"
             ],
             "limitations": [
                 "No options chain, implied volatility, Greeks, earnings calendar, or live news yet.",
                 "Option structures are inferred from underlying behavior until options-chain data is added.",
                 "Daily-bar grading cannot determine exact intraday order if stop and target hit on the same daily candle.",
+                "Live trade plans use intraday current_price when available; historical grouped close is retained separately.",
             ],
         },
         "universes": [await build_signal_rows(req, universe) for universe in universes],
@@ -1308,7 +1373,7 @@ async def performance() -> Dict[str, Any]:
 
 
 class DailyReportRequest(BaseModel):
-    universe: Literal["sp500", "dow30", "nasdaq100", "russell2000", "crypto", "watchlist", "all"] = "sp500"
+    universe: Literal["sp500", "dow30", "nasdaq100", "russell2000", "crypto", "all"] = "sp500"
     horizon: Literal["1d", "1w", "1mo"] = "1d"
     limit: int = Field(default=10, ge=1, le=25, description="Number of ranked setups to include in the email")
     refresh: bool = Field(default=False, description="Refresh cache before building the report")
@@ -1345,6 +1410,9 @@ def signal_report_text(payload: Dict[str, Any]) -> str:
             lines.append(f"   Close: {sig.get('close')} | RSI14: {hist.get('rsi14')} | ATR14: {hist.get('atr14')} ({hist.get('atr14_pct')}%)")
             lines.append(f"   5d: {hist.get('momentum_5d_pct')}% | 20d: {hist.get('momentum_20d_pct')}% | Volume anomaly: {hist.get('volume_anomaly_ratio')}x")
             lines.append(f"   Entry: {trade.get('entry')} | Stop: {trade.get('stop')} | T1: {trade.get('target_1')} | T2: {trade.get('target_2')} | R/R: {trade.get('reward_risk_to_target_2')}")
+            lines.append(f"   Entry basis: {trade.get('entry_basis')} | Previous historical entry: {trade.get('previous_historical_entry')}")
+            if sig.get("stale_entry_warning"):
+                lines.append(f"   Stale-entry adjustment: {sig.get('stale_entry_diff_pct')}% — live price used.")
             lines.append(f"   Structure: {sig.get('ideal_option_structure')} | Risk: {sig.get('risk_profile')}")
             lines.append("")
         skipped = universe_block.get("skipped") or []
@@ -1380,7 +1448,7 @@ def signal_report_html(payload: Dict[str, Any]) -> str:
             <tr>
               <th>#</th><th>Ticker</th><th>Setup</th><th>Score</th><th>Close</th>
               <th>RSI</th><th>ATR%</th><th>20d Mom</th><th>Vol Anom</th>
-              <th>Entry</th><th>Stop</th><th>T1</th><th>T2</th><th>R/R</th><th>Structure</th>
+              <th>Entry</th><th>Basis</th><th>Stop</th><th>T1</th><th>T2</th><th>R/R</th><th>Structure</th>
             </tr>
           </thead><tbody>
         """)
@@ -1399,6 +1467,7 @@ def signal_report_html(payload: Dict[str, Any]) -> str:
                 f"<td>{esc(hist.get('momentum_20d_pct'))}%</td>"
                 f"<td>{esc(hist.get('volume_anomaly_ratio'))}x</td>"
                 f"<td>{esc(trade.get('entry'))}</td>"
+                f"<td>{esc(trade.get('entry_basis'))}</td>"
                 f"<td>{esc(trade.get('stop'))}</td>"
                 f"<td>{esc(trade.get('target_1'))}</td>"
                 f"<td>{esc(trade.get('target_2'))}</td>"
@@ -1500,7 +1569,7 @@ async def daily_report(req: DailyReportRequest) -> Dict[str, Any]:
         "cache": cache_status(),
         "performance": performance_summary,
         "methodology": {
-            "version": "signals_v5_feedback_tracking",
+            "version": "signals_v6_live_trade_plan",
             "inputs": [
                 "open", "high", "low", "close", "volume", "dollar volume",
                 "30 market days of grouped historical bars", "ATR(14)", "RSI(14)",
