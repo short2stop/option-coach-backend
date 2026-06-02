@@ -1983,6 +1983,309 @@ async def premarket_signals(req: PremarketRequest) -> Dict[str, Any]:
 
 
 
+
+# -------------------------
+# End-of-day / overnight risk layer
+# -------------------------
+
+class OvernightRiskRequest(BaseModel):
+    universe: Literal["sp500", "dow30", "nasdaq100", "russell2000", "crypto", "watchlist", "all"] = "sp500"
+    horizon: Literal["1d", "1w", "1mo"] = "1d"
+    tickers: Optional[List[str]] = Field(default=None, description="Optional explicit ticker list")
+    refresh: bool = Field(default=False, description="Refresh cache before overnight risk check")
+    limit: int = Field(default=10, ge=1, le=50, description="Maximum number of candidates to return")
+    min_price: float = Field(default=0.0, ge=0.0)
+    min_volume: float = Field(default=0.0, ge=0.0)
+    include_news_catalysts: bool = Field(default=True, description="Include separate Polygon news catalyst scoring when available")
+
+
+def close_location_from_intraday(intraday: Dict[str, Any]) -> Optional[float]:
+    current = safe_float(intraday.get("current_price"))
+    high = safe_float(intraday.get("high"))
+    low = safe_float(intraday.get("low"))
+    rng = high - low
+    if current <= 0 or high <= 0 or low <= 0 or rng <= 0:
+        return None
+    return ((current - low) / rng) * 100
+
+
+def distance_from_low_pct(intraday: Dict[str, Any]) -> Optional[float]:
+    current = safe_float(intraday.get("current_price"))
+    low = safe_float(intraday.get("low"))
+    if current <= 0 or low <= 0:
+        return None
+    return ((current - low) / low) * 100
+
+
+def compute_overnight_risk(signal: Dict[str, Any]) -> Dict[str, Any]:
+    intraday = signal.get("intraday", {}) or {}
+    news = signal.get("news_catalyst", {}) or {}
+
+    current = safe_float(intraday.get("current_price"))
+    change_pct = safe_float(intraday.get("intraday_change_pct"))
+    distance_hod = safe_float(intraday.get("distance_from_high_pct"))
+    above_vwap = bool(intraday.get("above_vwap"))
+    above_open = bool(intraday.get("above_open"))
+    intraday_confirmed = bool(intraday.get("intraday_confirmed"))
+
+    close_location = close_location_from_intraday(intraday)
+    dist_lod = distance_from_low_pct(intraday)
+
+    news_score = safe_float(news.get("news_catalyst_score"))
+    news_label = str(news.get("news_catalyst_label") or "")
+
+    score = 50.0
+    risk_flags: List[str] = []
+    support_factors: List[str] = []
+
+    if current <= 0:
+        return {
+            "overnight_hold_score": 0,
+            "overnight_action": "cannot_assess_no_live_price",
+            "after_hours_dip_risk": "unknown",
+            "confidence_pct": 0,
+            "closing_strength": None,
+            "distance_from_lod_pct": None,
+            "risk_flags": ["No valid live current price available."],
+            "support_factors": [],
+            "reason": "Cannot assess overnight risk without a valid live price.",
+        }
+
+    if above_vwap:
+        score += 14
+        support_factors.append("Holding above VWAP")
+    else:
+        score -= 20
+        risk_flags.append("Below VWAP")
+
+    if above_open:
+        score += 8
+        support_factors.append("Above intraday open")
+    else:
+        score -= 10
+        risk_flags.append("Below intraday open")
+
+    if intraday_confirmed:
+        score += 12
+        support_factors.append("Intraday confirmation still valid")
+    else:
+        score -= 12
+        risk_flags.append("Intraday confirmation failed or weak")
+
+    if close_location is not None:
+        if close_location >= 80:
+            score += 16
+            support_factors.append("Trading in top 20% of intraday range")
+        elif close_location >= 60:
+            score += 8
+            support_factors.append("Trading in upper half of intraday range")
+        elif close_location <= 30:
+            score -= 18
+            risk_flags.append("Trading in bottom 30% of intraday range")
+        elif close_location <= 45:
+            score -= 8
+            risk_flags.append("Weak close-location inside intraday range")
+
+    if distance_hod >= -0.75:
+        score += 12
+        support_factors.append("Within 0.75% of high of day")
+    elif distance_hod >= -1.5:
+        score += 6
+        support_factors.append("Still near high of day")
+    elif distance_hod <= -4:
+        score -= 16
+        risk_flags.append("Fading far from high of day")
+    elif distance_hod <= -2.5:
+        score -= 8
+        risk_flags.append("Meaningfully off high of day")
+
+    if change_pct >= 3:
+        score += 10
+        support_factors.append("Strong positive intraday move")
+    elif change_pct >= 1:
+        score += 5
+        support_factors.append("Positive intraday move")
+    elif change_pct <= -3:
+        score -= 18
+        risk_flags.append("Large negative intraday move")
+    elif change_pct <= -1:
+        score -= 8
+        risk_flags.append("Negative intraday move")
+
+    if news_score >= 75:
+        score += 12
+        support_factors.append("Strong positive news catalyst")
+    elif news_score >= 60:
+        score += 6
+        support_factors.append("Positive news catalyst")
+    elif 0 < news_score <= 40:
+        score -= 10
+        risk_flags.append("Negative or weak news catalyst")
+
+    if "negative" in news_label:
+        score -= 8
+        risk_flags.append("News catalyst label is negative")
+
+    if change_pct >= 8 and distance_hod < -1.5 and news_score < 60:
+        score -= 10
+        risk_flags.append("Extended intraday move fading without strong news support")
+
+    score = clamp(score)
+
+    if score >= 78:
+        action = "hold_overnight"
+        dip_risk = "lower"
+    elif score >= 62:
+        action = "hold_partial_position"
+        dip_risk = "moderate"
+    elif score >= 45:
+        action = "take_profits_before_close"
+        dip_risk = "elevated"
+    else:
+        action = "exit_before_close"
+        dip_risk = "high"
+
+    if action == "hold_overnight":
+        reason = "Closing structure is strong enough to justify overnight exposure."
+    elif action == "hold_partial_position":
+        reason = "Setup remains constructive, but overnight gap risk justifies reducing exposure."
+    elif action == "take_profits_before_close":
+        reason = "Risk/reward into the close is no longer clearly favorable."
+    else:
+        reason = "Weak closing structure or risk flags argue against holding overnight."
+
+    return {
+        "overnight_hold_score": round(score, 1),
+        "overnight_action": action,
+        "after_hours_dip_risk": dip_risk,
+        "confidence_pct": round(score, 1),
+        "closing_strength": round(close_location, 1) if close_location is not None else None,
+        "distance_from_lod_pct": round(dist_lod, 2) if dist_lod is not None else None,
+        "risk_flags": risk_flags,
+        "support_factors": support_factors,
+        "reason": reason,
+    }
+
+
+async def build_overnight_risk_rows(req: OvernightRiskRequest, universe: str) -> Dict[str, Any]:
+    signals_req = SignalsRequest(
+        universe=universe,
+        horizon=req.horizon,
+        tickers=req.tickers,
+        refresh=False,
+        limit=req.limit,
+        min_price=req.min_price,
+        min_volume=req.min_volume,
+    )
+
+    base_block = await build_signal_rows(signals_req, universe)
+    payload = {
+        "horizon": req.horizon,
+        "polygon_enabled": bool(POLYGON_API_KEY),
+        "cache": cache_status(),
+        "universes": [base_block],
+    }
+
+    # News enrichment exists in the news-catalyst backend. Fall back gracefully if absent.
+    if req.include_news_catalysts and "enrich_payload_with_news_catalysts" in globals():
+        payload = await enrich_payload_with_news_catalysts(payload)
+
+    block = payload.get("universes", [{}])[0]
+    for sig in block.get("signals", []) or []:
+        sig["overnight_risk"] = compute_overnight_risk(sig)
+
+    signals = block.get("signals", []) or []
+    signals.sort(
+        key=lambda x: safe_float((x.get("overnight_risk") or {}).get("overnight_hold_score")),
+        reverse=True,
+    )
+
+    block["signals"] = signals[:req.limit]
+    block["returned"] = min(req.limit, len(signals))
+    return block
+
+
+@app.post("/overnight_risk")
+async def overnight_risk(req: OvernightRiskRequest) -> Dict[str, Any]:
+    if not INDEX_MAP and not req.tickers:
+        raise HTTPException(status_code=500, detail="No constituents loaded. Put constituents.json next to main.py or pass explicit tickers.")
+
+    if req.refresh or not cache_is_fresh():
+        await refresh_cache()
+
+    universes = ALL_UNIVERSES if req.universe == "all" else [req.universe]
+
+    payload = {
+        "horizon": req.horizon,
+        "polygon_enabled": bool(POLYGON_API_KEY),
+        "cache": cache_status(),
+        "methodology": {
+            "version": "overnight_risk_v1",
+            "inputs": [
+                "live current price",
+                "VWAP",
+                "intraday open",
+                "distance from HOD",
+                "distance from LOD",
+                "close location in intraday range",
+                "intraday confirmation",
+                "news catalyst score",
+            ],
+            "classification": [
+                "hold_overnight",
+                "hold_partial_position",
+                "take_profits_before_close",
+                "exit_before_close",
+            ],
+            "limitations": [
+                "Does not yet include earnings calendar.",
+                "Does not yet include options-chain IV crush risk.",
+                "After-hours liquidity can change rapidly after the assessment.",
+            ],
+        },
+        "universes": [await build_overnight_risk_rows(req, universe) for universe in universes],
+    }
+
+    all_signals: List[Dict[str, Any]] = []
+    for block in payload.get("universes", []) or []:
+        all_signals.extend(block.get("signals", []) or [])
+
+    payload["overnight_summary"] = {
+        "hold_overnight": [
+            s.get("ticker") for s in all_signals
+            if (s.get("overnight_risk") or {}).get("overnight_action") == "hold_overnight"
+        ],
+        "hold_partial_position": [
+            s.get("ticker") for s in all_signals
+            if (s.get("overnight_risk") or {}).get("overnight_action") == "hold_partial_position"
+        ],
+        "take_profits_before_close": [
+            s.get("ticker") for s in all_signals
+            if (s.get("overnight_risk") or {}).get("overnight_action") == "take_profits_before_close"
+        ],
+        "exit_before_close": [
+            s.get("ticker") for s in all_signals
+            if (s.get("overnight_risk") or {}).get("overnight_action") == "exit_before_close"
+        ],
+        "top_hold_scores": [
+            {
+                "ticker": s.get("ticker"),
+                "score": (s.get("overnight_risk") or {}).get("overnight_hold_score"),
+                "action": (s.get("overnight_risk") or {}).get("overnight_action"),
+            }
+            for s in sorted(
+                all_signals,
+                key=lambda x: safe_float((x.get("overnight_risk") or {}).get("overnight_hold_score")),
+                reverse=True,
+            )[:10]
+        ],
+    }
+
+    return payload
+
+
+
+
 class DailyReportRequest(BaseModel):
     include_news_catalysts: bool = Field(default=True, description="Include separate Polygon news catalyst scoring when available")
     universe: Literal["sp500", "dow30", "nasdaq100", "russell2000", "crypto", "watchlist", "all"] = "sp500"
