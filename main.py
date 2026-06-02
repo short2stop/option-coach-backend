@@ -305,17 +305,43 @@ async def fetch_intraday_snapshot(
 
         data = resp.json()
         ticker_data = data.get("ticker", {})
-        day = ticker_data.get("day", {})
-        prev_day = ticker_data.get("prevDay", {})
+        day = ticker_data.get("day", {}) or {}
+        minute = ticker_data.get("min", {}) or {}
+        prev_day = ticker_data.get("prevDay", {}) or {}
+        last_trade = ticker_data.get("lastTrade", {}) or {}
 
-        current_price = safe_float(day.get("c"))
-        open_price = safe_float(day.get("o"))
-        high_price = safe_float(day.get("h"))
-        low_price = safe_float(day.get("l"))
-        volume = safe_float(day.get("v"))
-        day_vwap = safe_float(day.get("vw"))
         prev_close = safe_float(prev_day.get("c"))
+        todays_change = safe_float(ticker_data.get("todaysChange"))
         intraday_change_pct = safe_float(ticker_data.get("todaysChangePerc"))
+
+        # Polygon snapshots sometimes return today's percent change while day.c/o/h/l/vw
+        # are still zero/empty. Fall back aggressively so live entries do not become stale.
+        current_price = (
+            safe_float(day.get("c"))
+            or safe_float(minute.get("c"))
+            or safe_float(last_trade.get("p"))
+        )
+
+        if current_price <= 0 and prev_close > 0 and todays_change != 0:
+            current_price = prev_close + todays_change
+
+        if current_price <= 0 and prev_close > 0 and intraday_change_pct != 0:
+            current_price = prev_close * (1 + intraday_change_pct / 100)
+
+        open_price = safe_float(day.get("o")) or safe_float(minute.get("o")) or prev_close or current_price
+        high_price = safe_float(day.get("h")) or safe_float(minute.get("h")) or max(open_price, current_price)
+        low_price = safe_float(day.get("l")) or safe_float(minute.get("l")) or min(open_price, current_price)
+
+        volume = (
+            safe_float(day.get("v"))
+            or safe_float(minute.get("av"))
+            or safe_float(minute.get("v"))
+        )
+
+        day_vwap = safe_float(day.get("vw")) or safe_float(minute.get("vw")) or current_price
+
+        if intraday_change_pct == 0 and prev_close > 0 and current_price > 0:
+            intraday_change_pct = ((current_price - prev_close) / prev_close) * 100
 
         distance_from_high_pct = 0.0
         if high_price > 0 and current_price > 0:
@@ -1031,11 +1057,11 @@ async def signals(req: SignalsRequest) -> Dict[str, Any]:
         "polygon_enabled": bool(POLYGON_API_KEY),
         "cache": cache_status(),
         "methodology": {
-            "version": "signals_v6_live_trade_plan",
+            "version": "signals_v7_snapshot_fallbacks",
             "inputs": [
                 "open", "high", "low", "close", "volume", "dollar volume",
                 "30 market days of grouped historical bars", "ATR(14)", "RSI(14)",
-                "SMA(5/10/20)", "5d momentum", "20d momentum", "volume anomaly", "live intraday snapshot", "intraday confirmation", "intraday ranking boost", "VWAP/HOD confirmation", "recommendation tracking", "target-before-stop grading", "live-price entry recalculation"
+                "SMA(5/10/20)", "5d momentum", "20d momentum", "volume anomaly", "live intraday snapshot", "intraday confirmation", "intraday ranking boost", "VWAP/HOD confirmation", "recommendation tracking", "target-before-stop grading", "live-price entry recalculation", "snapshot minute/last-trade fallback"
             ],
             "limitations": [
                 "No options chain, implied volatility, Greeks, earnings calendar, or live news yet.",
@@ -1569,7 +1595,7 @@ async def daily_report(req: DailyReportRequest) -> Dict[str, Any]:
         "cache": cache_status(),
         "performance": performance_summary,
         "methodology": {
-            "version": "signals_v6_live_trade_plan",
+            "version": "signals_v7_snapshot_fallbacks",
             "inputs": [
                 "open", "high", "low", "close", "volume", "dollar volume",
                 "30 market days of grouped historical bars", "ATR(14)", "RSI(14)",
