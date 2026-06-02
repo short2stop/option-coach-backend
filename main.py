@@ -71,7 +71,7 @@ INDEX_MAP = load_constituents()
 
 
 class ScreenRequest(BaseModel):
-    universe: Literal["sp500", "dow30", "nasdaq100", "russell2000", "crypto", "all"]
+    universe: Literal["sp500", "dow30", "nasdaq100", "russell2000", "crypto", "watchlist", "all"]
     horizon: Literal["1d", "1w", "1mo"] = "1d"
     tickers: Optional[List[str]] = Field(default=None, description="Optional explicit ticker list")
     refresh: bool = Field(default=False, description="Force a cache refresh before returning data")
@@ -718,7 +718,7 @@ async def screen(req: ScreenRequest) -> Dict[str, Any]:
 
 
 class SignalsRequest(BaseModel):
-    universe: Literal["sp500", "dow30", "nasdaq100", "russell2000", "crypto", "all"] = "sp500"
+    universe: Literal["sp500", "dow30", "nasdaq100", "russell2000", "crypto", "watchlist", "all"] = "sp500"
     horizon: Literal["1d", "1w", "1mo"] = "1d"
     tickers: Optional[List[str]] = Field(default=None, description="Optional explicit ticker list")
     refresh: bool = Field(default=False, description="Force a cache refresh before returning signals")
@@ -1057,7 +1057,7 @@ async def signals(req: SignalsRequest) -> Dict[str, Any]:
         "polygon_enabled": bool(POLYGON_API_KEY),
         "cache": cache_status(),
         "methodology": {
-            "version": "signals_v7_snapshot_fallbacks",
+            "version": "signals_v8_watchlist_snapshot_premarket",
             "inputs": [
                 "open", "high", "low", "close", "volume", "dollar volume",
                 "30 market days of grouped historical bars", "ATR(14)", "RSI(14)",
@@ -1398,8 +1398,321 @@ async def performance() -> Dict[str, Any]:
     return await evaluate_tracked_signals()
 
 
+
+# -------------------------
+# Premarket signal layer
+# -------------------------
+
+class PremarketRequest(BaseModel):
+    universe: Literal["sp500", "dow30", "nasdaq100", "russell2000", "crypto", "watchlist", "all"] = "sp500"
+    horizon: Literal["1d", "1w", "1mo"] = "1d"
+    tickers: Optional[List[str]] = Field(default=None, description="Optional explicit ticker list")
+    refresh: bool = Field(default=False, description="Refresh daily cache before returning premarket signals")
+    limit: int = Field(default=10, ge=1, le=50, description="Maximum number of ranked candidates to return")
+    min_price: float = Field(default=0.0, ge=0.0, description="Minimum underlying price")
+    min_volume: float = Field(default=0.0, ge=0.0, description="Minimum prior-day share volume")
+    min_premarket_volume: float = Field(default=0.0, ge=0.0, description="Minimum premarket share volume")
+
+
+def premarket_window_utc_ms() -> tuple[int, int]:
+    today = datetime.now(timezone.utc).date()
+    start = datetime(today.year, today.month, today.day, 8, 0, tzinfo=timezone.utc)
+    end = datetime(today.year, today.month, today.day, 14, 30, tzinfo=timezone.utc)
+    return int(start.timestamp() * 1000), int(end.timestamp() * 1000)
+
+
+async def fetch_premarket_bars(client: httpx.AsyncClient, ticker: str) -> List[Dict[str, Any]]:
+    if not POLYGON_API_KEY:
+        return []
+
+    today = datetime.now(timezone.utc).date().isoformat()
+    url = f"https://api.polygon.io/v2/aggs/ticker/{polygon_stock_key(ticker)}/range/5/minute/{today}/{today}"
+    params = {
+        "adjusted": "true",
+        "sort": "asc",
+        "limit": 5000,
+        "apiKey": POLYGON_API_KEY,
+    }
+
+    start_ms, end_ms = premarket_window_utc_ms()
+
+    try:
+        resp = await client.get(url, params=params)
+        if resp.status_code != 200:
+            return []
+        rows = resp.json().get("results") or []
+    except Exception:
+        return []
+
+    bars: List[Dict[str, Any]] = []
+    for r in rows:
+        ts = r.get("t")
+        if ts is None or ts < start_ms or ts > end_ms:
+            continue
+        bars.append({
+            "t": ts,
+            "open": safe_float(r.get("o")),
+            "high": safe_float(r.get("h")),
+            "low": safe_float(r.get("l")),
+            "close": safe_float(r.get("c")),
+            "volume": safe_float(r.get("v")),
+            "vwap": safe_float(r.get("vw")),
+        })
+    return bars
+
+
+def classify_premarket_setup(gap_pct: float, distance_from_high_pct: float, position_pct: float, premarket_volume: float, range_pct: float) -> tuple[str, str]:
+    if premarket_volume <= 0:
+        return "no_premarket_data", "wait_for_open_confirmation"
+    if gap_pct > 0 and distance_from_high_pct >= -1.0 and position_pct >= 70:
+        if gap_pct >= 8:
+            return "extended_gap_and_hold", "wait_for_opening_range_break_or_pullback"
+        return "gap_and_hold", "buy_opening_range_break_or_vwap_reclaim"
+    if gap_pct > 0 and position_pct < 40:
+        return "gap_and_fade", "avoid_or_wait_for_reclaim"
+    if gap_pct < 0 and position_pct >= 70:
+        return "red_to_green_attempt", "wait_for_prior_close_reclaim"
+    if range_pct >= 5 and distance_from_high_pct < -2:
+        return "premarket_exhaustion", "avoid_chasing"
+    return "neutral_premarket", "wait_for_open_confirmation"
+
+
+def build_premarket_metrics(ticker: str, prev_close: float, bars: List[Dict[str, Any]]) -> Dict[str, Any]:
+    if not bars or prev_close <= 0:
+        return {
+            "ticker": ticker,
+            "premarket_available": False,
+            "premarket_price": None,
+            "gap_pct": None,
+            "premarket_high": None,
+            "premarket_low": None,
+            "premarket_volume": 0,
+            "distance_from_premarket_high_pct": None,
+            "premarket_range_pct": None,
+            "premarket_position_pct": None,
+            "premarket_setup": "no_premarket_data",
+            "opening_strategy": "wait_for_open_confirmation",
+        }
+
+    price = safe_float(bars[-1].get("close"))
+    high = max(safe_float(b.get("high")) for b in bars)
+    low = min(safe_float(b.get("low")) for b in bars)
+    volume = sum(safe_float(b.get("volume")) for b in bars)
+
+    gap_pct = ((price - prev_close) / prev_close) * 100 if prev_close else 0.0
+    rng = max(high - low, 0.0)
+    range_pct = (rng / price) * 100 if price else 0.0
+    distance_from_high_pct = ((price - high) / high) * 100 if high else 0.0
+    position_pct = ((price - low) / rng) * 100 if rng > 0 else 50.0
+
+    setup, strategy = classify_premarket_setup(gap_pct, distance_from_high_pct, position_pct, volume, range_pct)
+
+    return {
+        "ticker": ticker,
+        "premarket_available": True,
+        "premarket_price": round(price, 4),
+        "gap_pct": round(gap_pct, 2),
+        "premarket_high": round(high, 4),
+        "premarket_low": round(low, 4),
+        "premarket_volume": round(volume, 0),
+        "distance_from_premarket_high_pct": round(distance_from_high_pct, 2),
+        "premarket_range_pct": round(range_pct, 2),
+        "premarket_position_pct": round(position_pct, 1),
+        "premarket_setup": setup,
+        "opening_strategy": strategy,
+    }
+
+
+def premarket_quality_score(metrics: Dict[str, Any], signal: Dict[str, Any]) -> float:
+    if not metrics.get("premarket_available"):
+        return 0.0
+
+    gap = safe_float(metrics.get("gap_pct"))
+    dist = safe_float(metrics.get("distance_from_premarket_high_pct"))
+    pos = safe_float(metrics.get("premarket_position_pct"))
+    vol = safe_float(metrics.get("premarket_volume"))
+    rng = safe_float(metrics.get("premarket_range_pct"))
+    hist = safe_float(signal.get("overall_score"))
+
+    score = 40.0
+
+    if 0.5 <= gap <= 6:
+        score += 20
+    elif 6 < gap <= 10:
+        score += 10
+    elif gap > 10:
+        score -= 5
+    elif gap < -1:
+        score -= 10
+
+    if dist >= -0.5:
+        score += 20
+    elif dist >= -1.0:
+        score += 14
+    elif dist >= -2.0:
+        score += 6
+    else:
+        score -= 10
+
+    if pos >= 80:
+        score += 12
+    elif pos >= 65:
+        score += 8
+    elif pos < 40:
+        score -= 10
+
+    if vol >= 1000000:
+        score += 12
+    elif vol >= 250000:
+        score += 8
+    elif vol >= 50000:
+        score += 4
+    else:
+        score -= 5
+
+    if rng > 10:
+        score -= 8
+
+    score += (hist - 50) * 0.15
+    return clamp(score)
+
+
+def recalculate_trade_plan_from_premarket_price(signal: Dict[str, Any], metrics: Dict[str, Any]) -> Dict[str, Any]:
+    trade = signal.get("trade_plan", {}) or {}
+    history = signal.get("history", {}) or {}
+
+    price = safe_float(metrics.get("premarket_price"))
+    if price <= 0:
+        return signal
+
+    old_entry = safe_float(trade.get("entry"))
+    atr14 = safe_float(history.get("atr14"))
+    high = safe_float(metrics.get("premarket_high"))
+    low = safe_float(metrics.get("premarket_low"))
+    rng = max(high - low, 0.0)
+
+    risk_unit = atr14 if atr14 > 0 else max(rng * 0.75, price * 0.015)
+    risk_per_share = max(risk_unit * 0.75, price * 0.01)
+
+    entry = round(price, 2)
+    stop = round(max(entry - risk_per_share, 0.01), 2)
+    target_1 = round(entry + risk_per_share * 1.5, 2)
+    target_2 = round(entry + risk_per_share * 2.5, 2)
+
+    signal["historical_trade_plan"] = dict(trade)
+    signal["premarket_price_used_for_trade_plan"] = True
+    signal["stale_entry_diff_pct"] = round(((entry - old_entry) / old_entry) * 100, 2) if old_entry > 0 else None
+    signal["stale_entry_warning"] = bool(old_entry > 0 and abs(((entry - old_entry) / old_entry) * 100) >= 1.0)
+
+    trade["entry"] = entry
+    trade["stop"] = stop
+    trade["target_1"] = target_1
+    trade["target_2"] = target_2
+    trade["risk_per_share"] = round(entry - stop, 2)
+    trade["reward_risk_to_target_2"] = round((target_2 - entry) / max(entry - stop, 0.01), 2)
+    trade["invalidates_below"] = stop
+    trade["entry_basis"] = "premarket_price"
+    trade["previous_historical_entry"] = round(old_entry, 2) if old_entry > 0 else None
+    trade["opening_strategy"] = metrics.get("opening_strategy")
+
+    signal["trade_plan"] = trade
+    return signal
+
+
+async def build_premarket_rows(req: PremarketRequest, universe: str) -> Dict[str, Any]:
+    signals_req = SignalsRequest(
+        universe=universe,
+        horizon=req.horizon,
+        tickers=req.tickers,
+        refresh=False,
+        limit=min(max(req.limit, 1), 50),
+        min_price=req.min_price,
+        min_volume=req.min_volume,
+    )
+
+    base_block = await build_signal_rows(signals_req, universe)
+    signals = base_block.get("signals", [])
+
+    timeout = httpx.Timeout(connect=10.0, read=25.0, write=10.0, pool=25.0)
+    semaphore = asyncio.Semaphore(8)
+
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        async def one(sig: Dict[str, Any]) -> Dict[str, Any]:
+            ticker = str(sig.get("ticker") or "").upper()
+            async with semaphore:
+                prev_close = safe_float(sig.get("close"))
+                bars = await fetch_premarket_bars(client, ticker)
+                metrics = build_premarket_metrics(ticker, prev_close, bars)
+                sig["premarket"] = metrics
+                sig["premarket_quality_score"] = round(premarket_quality_score(metrics, sig), 1)
+
+                if safe_float(metrics.get("premarket_volume")) < req.min_premarket_volume:
+                    sig["premarket_excluded_reason"] = "Below min_premarket_volume"
+                else:
+                    sig = recalculate_trade_plan_from_premarket_price(sig, metrics)
+
+                await asyncio.sleep(0.05)
+                return sig
+
+        updated = await asyncio.gather(*(one(s) for s in signals), return_exceptions=True)
+
+    candidates = [x for x in updated if isinstance(x, dict) and not x.get("premarket_excluded_reason")]
+    candidates.sort(
+        key=lambda x: (
+            safe_float(x.get("premarket_quality_score")),
+            safe_float(x.get("overall_score")),
+        ),
+        reverse=True,
+    )
+
+    return {
+        "universe": universe,
+        "candidate_count": len(candidates),
+        "returned": min(req.limit, len(candidates)),
+        "signals": candidates[:req.limit],
+        "skipped": base_block.get("skipped", []),
+    }
+
+
+@app.post("/premarket_signals")
+async def premarket_signals(req: PremarketRequest) -> Dict[str, Any]:
+    if not INDEX_MAP and not req.tickers:
+        raise HTTPException(status_code=500, detail="No constituents loaded. Put constituents.json next to main.py or pass explicit tickers.")
+
+    if req.refresh or not cache_is_fresh():
+        await refresh_cache()
+
+    universes = ALL_UNIVERSES if req.universe == "all" else [req.universe]
+
+    return {
+        "horizon": req.horizon,
+        "polygon_enabled": bool(POLYGON_API_KEY),
+        "cache": cache_status(),
+        "methodology": {
+            "version": "premarket_signals_v1",
+            "inputs": [
+                "prior daily OHLCV",
+                "historical ATR/RSI/momentum",
+                "5-minute premarket aggregates",
+                "premarket gap",
+                "premarket high/low",
+                "premarket volume",
+                "distance from premarket high",
+                "premarket range position"
+            ],
+            "limitations": [
+                "Premarket liquidity can be thin and misleading.",
+                "Opening volatility can invalidate premarket levels quickly.",
+                "Options chains, IV, Greeks, earnings, news, and flow are not included yet."
+            ],
+        },
+        "universes": [await build_premarket_rows(req, universe) for universe in universes],
+    }
+
+
+
 class DailyReportRequest(BaseModel):
-    universe: Literal["sp500", "dow30", "nasdaq100", "russell2000", "crypto", "all"] = "sp500"
+    universe: Literal["sp500", "dow30", "nasdaq100", "russell2000", "crypto", "watchlist", "all"] = "sp500"
     horizon: Literal["1d", "1w", "1mo"] = "1d"
     limit: int = Field(default=10, ge=1, le=25, description="Number of ranked setups to include in the email")
     refresh: bool = Field(default=False, description="Refresh cache before building the report")
@@ -1595,7 +1908,7 @@ async def daily_report(req: DailyReportRequest) -> Dict[str, Any]:
         "cache": cache_status(),
         "performance": performance_summary,
         "methodology": {
-            "version": "signals_v7_snapshot_fallbacks",
+            "version": "signals_v8_watchlist_snapshot_premarket",
             "inputs": [
                 "open", "high", "low", "close", "volume", "dollar volume",
                 "30 market days of grouped historical bars", "ATR(14)", "RSI(14)",
