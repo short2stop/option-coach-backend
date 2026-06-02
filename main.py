@@ -718,6 +718,7 @@ async def screen(req: ScreenRequest) -> Dict[str, Any]:
 
 
 class SignalsRequest(BaseModel):
+    include_news_catalysts: bool = Field(default=True, description="Include separate Polygon news catalyst scoring when available")
     universe: Literal["sp500", "dow30", "nasdaq100", "russell2000", "crypto", "watchlist", "all"] = "sp500"
     horizon: Literal["1d", "1w", "1mo"] = "1d"
     tickers: Optional[List[str]] = Field(default=None, description="Optional explicit ticker list")
@@ -1057,7 +1058,7 @@ async def signals(req: SignalsRequest) -> Dict[str, Any]:
         "polygon_enabled": bool(POLYGON_API_KEY),
         "cache": cache_status(),
         "methodology": {
-            "version": "signals_v8_watchlist_snapshot_premarket",
+            "version": "signals_v9_news_catalysts",
             "inputs": [
                 "open", "high", "low", "close", "volume", "dollar volume",
                 "30 market days of grouped historical bars", "ATR(14)", "RSI(14)",
@@ -1072,6 +1073,8 @@ async def signals(req: SignalsRequest) -> Dict[str, Any]:
         },
         "universes": [await build_signal_rows(req, universe) for universe in universes],
     }
+    if getattr(req, "include_news_catalysts", True):
+        payload = await enrich_payload_with_news_catalysts(payload)
     payload["tracking"] = track_signal_recommendations(payload)
     return payload
 
@@ -1399,11 +1402,276 @@ async def performance() -> Dict[str, Any]:
 
 
 
+
+
+# -------------------------
+# News catalyst layer
+# -------------------------
+
+NEWS_LOOKBACK_HOURS = int(os.getenv("OPTION_COACH_NEWS_LOOKBACK_HOURS", "24"))
+NEWS_MAX_ARTICLES_PER_TICKER = int(os.getenv("OPTION_COACH_NEWS_MAX_ARTICLES_PER_TICKER", "5"))
+
+
+def news_since_iso(hours: int = NEWS_LOOKBACK_HOURS) -> str:
+    return (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat().replace("+00:00", "Z")
+
+
+def score_news_text(title: str, description: str = "") -> Dict[str, Any]:
+    text_blob = f"{title} {description}".lower()
+
+    bullish_terms = {
+        "beats": 16,
+        "beat": 12,
+        "raises guidance": 20,
+        "raises outlook": 18,
+        "record revenue": 16,
+        "surges": 10,
+        "jumps": 8,
+        "rallies": 8,
+        "upgrade": 12,
+        "upgraded": 12,
+        "price target raised": 14,
+        "partnership": 12,
+        "contract": 14,
+        "order": 12,
+        "acquisition": 10,
+        "ai": 10,
+        "artificial intelligence": 10,
+        "nvidia": 14,
+        "trillion-dollar": 18,
+        "data center": 10,
+        "defense": 8,
+        "approval": 14,
+        "patent": 8,
+        "funding": 8,
+        "buyback": 12,
+        "dividend increase": 10,
+    }
+
+    bearish_terms = {
+        "misses": -18,
+        "miss": -12,
+        "cuts guidance": -22,
+        "cuts outlook": -20,
+        "downgrade": -14,
+        "downgraded": -14,
+        "offering": -18,
+        "public offering": -20,
+        "dilution": -18,
+        "investigation": -12,
+        "lawsuit": -12,
+        "recall": -14,
+        "bankruptcy": -25,
+        "going concern": -22,
+        "resigns": -10,
+        "halt": -18,
+        "halts": -18,
+        "delisting": -25,
+        "loss widens": -14,
+        "revenue falls": -12,
+    }
+
+    raw_score = 0
+    matched_positive: List[str] = []
+    matched_negative: List[str] = []
+
+    for term, points in bullish_terms.items():
+        if term in text_blob:
+            raw_score += points
+            matched_positive.append(term)
+
+    for term, points in bearish_terms.items():
+        if term in text_blob:
+            raw_score += points
+            matched_negative.append(term)
+
+    catalyst_score = clamp(50 + raw_score, 0, 100)
+
+    if catalyst_score >= 75:
+        label = "strong_positive_catalyst"
+    elif catalyst_score >= 60:
+        label = "positive_catalyst"
+    elif catalyst_score <= 25:
+        label = "strong_negative_catalyst"
+    elif catalyst_score <= 40:
+        label = "negative_catalyst"
+    else:
+        label = "neutral_or_no_clear_catalyst"
+
+    return {
+        "score": round(catalyst_score, 1),
+        "label": label,
+        "matched_positive_terms": matched_positive[:10],
+        "matched_negative_terms": matched_negative[:10],
+    }
+
+
+async def fetch_polygon_news_for_ticker(client: httpx.AsyncClient, ticker: str) -> List[Dict[str, Any]]:
+    if not POLYGON_API_KEY:
+        return []
+
+    url = "https://api.polygon.io/v2/reference/news"
+    params = {
+        "ticker": polygon_stock_key(ticker),
+        "published_utc.gte": news_since_iso(),
+        "order": "desc",
+        "limit": NEWS_MAX_ARTICLES_PER_TICKER,
+        "apiKey": POLYGON_API_KEY,
+    }
+
+    try:
+        resp = await client.get(url, params=params)
+        if resp.status_code != 200:
+            return []
+        rows = resp.json().get("results") or []
+    except Exception:
+        return []
+
+    articles: List[Dict[str, Any]] = []
+    for r in rows[:NEWS_MAX_ARTICLES_PER_TICKER]:
+        title = str(r.get("title") or "")
+        description = str(r.get("description") or "")
+        scoring = score_news_text(title, description)
+        publisher = r.get("publisher") or {}
+
+        articles.append({
+            "title": title,
+            "publisher": publisher.get("name"),
+            "published_utc": r.get("published_utc"),
+            "article_url": r.get("article_url"),
+            "description": description[:280] if description else None,
+            "score": scoring.get("score"),
+            "label": scoring.get("label"),
+            "matched_positive_terms": scoring.get("matched_positive_terms"),
+            "matched_negative_terms": scoring.get("matched_negative_terms"),
+        })
+
+    return articles
+
+
+def combine_news_articles(ticker: str, articles: List[Dict[str, Any]]) -> Dict[str, Any]:
+    if not articles:
+        return {
+            "ticker": ticker,
+            "lookback_hours": NEWS_LOOKBACK_HOURS,
+            "article_count": 0,
+            "news_catalyst_score": 0,
+            "news_catalyst_label": "no_recent_news_found",
+            "top_headlines": [],
+            "positive_terms": [],
+            "negative_terms": [],
+            "note": "No Polygon news articles found in the configured lookback window.",
+        }
+
+    weighted_total = 0.0
+    weight_sum = 0.0
+    for i, article in enumerate(articles):
+        score = safe_float(article.get("score"), 50.0)
+        weight = max(1.0, len(articles) - i)
+        weighted_total += score * weight
+        weight_sum += weight
+
+    combined_score = weighted_total / weight_sum if weight_sum else 50.0
+
+    pos_terms: List[str] = []
+    neg_terms: List[str] = []
+    for article in articles:
+        pos_terms.extend(article.get("matched_positive_terms") or [])
+        neg_terms.extend(article.get("matched_negative_terms") or [])
+
+    if combined_score >= 75:
+        label = "strong_positive_catalyst"
+    elif combined_score >= 60:
+        label = "positive_catalyst"
+    elif combined_score <= 25:
+        label = "strong_negative_catalyst"
+    elif combined_score <= 40:
+        label = "negative_catalyst"
+    else:
+        label = "neutral_or_mixed_news"
+
+    return {
+        "ticker": ticker,
+        "lookback_hours": NEWS_LOOKBACK_HOURS,
+        "article_count": len(articles),
+        "news_catalyst_score": round(combined_score, 1),
+        "news_catalyst_label": label,
+        "top_headlines": articles[:3],
+        "positive_terms": sorted(set(pos_terms))[:12],
+        "negative_terms": sorted(set(neg_terms))[:12],
+    }
+
+
+async def enrich_payload_with_news_catalysts(payload: Dict[str, Any]) -> Dict[str, Any]:
+    tickers: List[str] = []
+
+    for universe_block in payload.get("universes", []) or []:
+        for sig in universe_block.get("signals", []) or []:
+            ticker = str(sig.get("ticker") or "").upper()
+            if ticker and not is_crypto_ticker(ticker):
+                tickers.append(ticker)
+
+    tickers = sorted(set(tickers))
+
+    if not tickers:
+        payload["news_catalyst_summary"] = {
+            "enabled": bool(POLYGON_API_KEY),
+            "lookback_hours": NEWS_LOOKBACK_HOURS,
+            "tickers_checked": 0,
+            "top_news_catalysts": [],
+        }
+        return payload
+
+    timeout = httpx.Timeout(connect=10.0, read=20.0, write=10.0, pool=20.0)
+    semaphore = asyncio.Semaphore(6)
+    news_map: Dict[str, Dict[str, Any]] = {}
+
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        async def one(ticker: str) -> None:
+            async with semaphore:
+                articles = await fetch_polygon_news_for_ticker(client, ticker)
+                news_map[ticker] = combine_news_articles(ticker, articles)
+                await asyncio.sleep(0.05)
+
+        await asyncio.gather(*(one(t) for t in tickers), return_exceptions=True)
+
+    for universe_block in payload.get("universes", []) or []:
+        for sig in universe_block.get("signals", []) or []:
+            ticker = str(sig.get("ticker") or "").upper()
+            catalyst = news_map.get(ticker) or combine_news_articles(ticker, [])
+            sig["news_catalyst"] = catalyst
+
+            technical = safe_float(sig.get("overall_score"))
+            news_score = safe_float(catalyst.get("news_catalyst_score"))
+            sig["technical_plus_news_score"] = round(
+                clamp(technical * 0.82 + news_score * 0.18) if news_score > 0 else technical,
+                1,
+            )
+
+    top = sorted(
+        [v for v in news_map.values() if safe_float(v.get("news_catalyst_score")) > 0],
+        key=lambda x: safe_float(x.get("news_catalyst_score")),
+        reverse=True,
+    )[:10]
+
+    payload["news_catalyst_summary"] = {
+        "enabled": bool(POLYGON_API_KEY),
+        "lookback_hours": NEWS_LOOKBACK_HOURS,
+        "tickers_checked": len(tickers),
+        "top_news_catalysts": top,
+        "note": "News catalyst score is separate from technical ranking. Use it to explain/confirm why a setup may be moving, especially premarket.",
+    }
+
+    return payload
+
+
+
 # -------------------------
 # Premarket signal layer
 # -------------------------
 
 class PremarketRequest(BaseModel):
+    include_news_catalysts: bool = Field(default=True, description="Include separate Polygon news catalyst scoring when available")
     universe: Literal["sp500", "dow30", "nasdaq100", "russell2000", "crypto", "watchlist", "all"] = "sp500"
     horizon: Literal["1d", "1w", "1mo"] = "1d"
     tickers: Optional[List[str]] = Field(default=None, description="Optional explicit ticker list")
@@ -1684,7 +1952,7 @@ async def premarket_signals(req: PremarketRequest) -> Dict[str, Any]:
 
     universes = ALL_UNIVERSES if req.universe == "all" else [req.universe]
 
-    return {
+    payload = {
         "horizon": req.horizon,
         "polygon_enabled": bool(POLYGON_API_KEY),
         "cache": cache_status(),
@@ -1709,9 +1977,14 @@ async def premarket_signals(req: PremarketRequest) -> Dict[str, Any]:
         "universes": [await build_premarket_rows(req, universe) for universe in universes],
     }
 
+    if getattr(req, "include_news_catalysts", True):
+        payload = await enrich_payload_with_news_catalysts(payload)
+    return payload
+
 
 
 class DailyReportRequest(BaseModel):
+    include_news_catalysts: bool = Field(default=True, description="Include separate Polygon news catalyst scoring when available")
     universe: Literal["sp500", "dow30", "nasdaq100", "russell2000", "crypto", "watchlist", "all"] = "sp500"
     horizon: Literal["1d", "1w", "1mo"] = "1d"
     limit: int = Field(default=10, ge=1, le=25, description="Number of ranked setups to include in the email")
@@ -1908,7 +2181,7 @@ async def daily_report(req: DailyReportRequest) -> Dict[str, Any]:
         "cache": cache_status(),
         "performance": performance_summary,
         "methodology": {
-            "version": "signals_v8_watchlist_snapshot_premarket",
+            "version": "signals_v9_news_catalysts",
             "inputs": [
                 "open", "high", "low", "close", "volume", "dollar volume",
                 "30 market days of grouped historical bars", "ATR(14)", "RSI(14)",
@@ -1922,6 +2195,8 @@ async def daily_report(req: DailyReportRequest) -> Dict[str, Any]:
         "universes": [await build_signal_rows(signals_req, universe) for universe in universes],
     }
 
+    if getattr(req, "include_news_catalysts", True):
+        payload = await enrich_payload_with_news_catalysts(payload)
     payload["tracking"] = track_signal_recommendations(payload)
 
     subject_date = payload.get("cache", {}).get("market_date") or datetime.now(timezone.utc).date().isoformat()
