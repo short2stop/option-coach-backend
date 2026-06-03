@@ -2286,6 +2286,436 @@ async def overnight_risk(req: OvernightRiskRequest) -> Dict[str, Any]:
 
 
 
+
+# -------------------------
+# After-hours dip-buy order ticket layer
+# -------------------------
+
+class AfterHoursDipOrderRequest(BaseModel):
+    universe: Literal["sp500", "dow30", "nasdaq100", "russell2000", "crypto", "watchlist", "all"] = "watchlist"
+    horizon: Literal["1d", "1w", "1mo"] = "1d"
+    tickers: Optional[List[str]] = Field(default=None, description="Optional explicit ticker list")
+    refresh: bool = Field(default=False, description="Refresh cache before generating after-hours dip tickets")
+    limit: int = Field(default=10, ge=1, le=50)
+    min_price: float = Field(default=0.0, ge=0.0)
+    min_volume: float = Field(default=0.0, ge=0.0)
+    include_news_catalysts: bool = Field(default=True)
+    max_position_dollars: float = Field(default=500.0, ge=0.0, description="Maximum dollars per ticker for share quantity estimates")
+    dip_levels_pct: List[float] = Field(default=[1.0, 2.0, 3.0], description="Dip percentages below current price for limit order tickets")
+    require_above_vwap: bool = Field(default=True, description="Only create buy tickets if price is above VWAP")
+    require_intraday_confirmed: bool = Field(default=True, description="Only create buy tickets if intraday confirmation is valid")
+    allow_very_high_risk: bool = Field(default=False, description="If false, very-high-risk names are capped or skipped unless strong technical conditions exist")
+
+
+def compute_after_hours_dip_order_plan(signal: Dict[str, Any], req: AfterHoursDipOrderRequest) -> Dict[str, Any]:
+    ticker = str(signal.get("ticker") or "").upper()
+    intraday = signal.get("intraday", {}) or {}
+    trade = signal.get("trade_plan", {}) or {}
+    news = signal.get("news_catalyst", {}) or {}
+    history = signal.get("history", {}) or {}
+
+    current = safe_float(intraday.get("current_price"))
+    vwap = safe_float(intraday.get("day_vwap"))
+    above_vwap = bool(intraday.get("above_vwap"))
+    intraday_confirmed = bool(intraday.get("intraday_confirmed"))
+    distance_hod = safe_float(intraday.get("distance_from_high_pct"))
+    change_pct = safe_float(intraday.get("intraday_change_pct"))
+    atr_pct = safe_float(history.get("atr14_pct"))
+    volume_anomaly = safe_float(history.get("volume_anomaly_ratio"))
+    risk_profile = str(signal.get("risk_profile") or "").lower()
+    news_score = safe_float(news.get("news_catalyst_score"))
+
+    skip_reasons: List[str] = []
+    warnings: List[str] = []
+    support_factors: List[str] = []
+
+    if current <= 0:
+        skip_reasons.append("No valid live current price.")
+    if req.require_above_vwap and not above_vwap:
+        skip_reasons.append("Current price is not above VWAP.")
+    if req.require_intraday_confirmed and not intraday_confirmed:
+        skip_reasons.append("Intraday confirmation is not valid.")
+    if vwap <= 0:
+        warnings.append("VWAP unavailable or invalid.")
+    if "very high" in risk_profile and not req.allow_very_high_risk:
+        warnings.append("Very-high-risk stock; use smaller size or skip unless intentionally speculative.")
+    if current < 5:
+        warnings.append("Low-priced stock under $5; after-hours liquidity and spreads may be poor.")
+    if news_score == 0:
+        warnings.append("No recent news catalyst found; dip-buy thesis is technical only.")
+    if volume_anomaly > 0 and volume_anomaly < 1:
+        warnings.append("Volume anomaly below 1.0; today's move may not have above-average participation.")
+    if atr_pct >= 6:
+        warnings.append("High ATR%; use wider stops and smaller sizing.")
+
+    if above_vwap:
+        support_factors.append("Above VWAP")
+    if intraday_confirmed:
+        support_factors.append("Intraday confirmation valid")
+    if distance_hod >= -1:
+        support_factors.append("Near high of day")
+    if news_score >= 60:
+        support_factors.append("Positive news catalyst")
+    if change_pct > 0:
+        support_factors.append("Positive intraday trend")
+
+    tickets: List[Dict[str, Any]] = []
+
+    if not skip_reasons:
+        for pct in req.dip_levels_pct:
+            pct = abs(safe_float(pct))
+            if pct <= 0:
+                continue
+
+            limit_price = round(current * (1 - pct / 100), 2)
+
+            # Do not place dip buys below VWAP unless the user intentionally disables VWAP requirement.
+            if req.require_above_vwap and vwap > 0 and limit_price < vwap:
+                ticket_status = "watch_only_below_vwap"
+                ticket_note = "Limit is below VWAP; this should require VWAP reclaim before buying."
+            else:
+                ticket_status = "eligible_manual_ticket"
+                ticket_note = "Review spread/liquidity before placing."
+
+            estimated_shares = int(req.max_position_dollars // limit_price) if limit_price > 0 and req.max_position_dollars > 0 else None
+            estimated_notional = round(estimated_shares * limit_price, 2) if estimated_shares else None
+
+            tickets.append({
+                "ticker": ticker,
+                "side": "BUY",
+                "order_type": "LIMIT",
+                "time_in_force": "DAY_PLUS_EXTENDED_HOURS",
+                "limit_price": limit_price,
+                "dip_pct_from_current": pct,
+                "estimated_shares": estimated_shares,
+                "estimated_notional": estimated_notional,
+                "status": ticket_status,
+                "note": ticket_note,
+            })
+
+    # Suggested cancel / invalidation level for all dip tickets.
+    stop = safe_float(trade.get("stop"))
+    invalidates_below = safe_float(trade.get("invalidates_below")) or stop
+    if invalidates_below <= 0 and vwap > 0:
+        invalidates_below = round(vwap * 0.99, 2)
+
+    if skip_reasons:
+        action = "do_not_place_after_hours_dip_orders"
+    elif warnings and ("very-high-risk" in " ".join(warnings).lower() or current < 5):
+        action = "manual_review_small_size_only"
+    else:
+        action = "eligible_for_manual_after_hours_dip_tickets"
+
+    return {
+        "ticker": ticker,
+        "current_price": round(current, 4) if current else None,
+        "vwap": round(vwap, 4) if vwap else None,
+        "intraday_change_pct": round(change_pct, 2),
+        "distance_from_hod_pct": round(distance_hod, 2),
+        "above_vwap": above_vwap,
+        "intraday_confirmed": intraday_confirmed,
+        "risk_profile": signal.get("risk_profile"),
+        "news_catalyst_score": news_score,
+        "action": action,
+        "support_factors": support_factors,
+        "warnings": warnings,
+        "skip_reasons": skip_reasons,
+        "cancel_if_below": round(invalidates_below, 2) if invalidates_below else None,
+        "manual_order_tickets": tickets,
+        "important_note": "These are manual limit-order tickets only. This endpoint does not submit orders to Schwab or any broker.",
+    }
+
+
+async def build_after_hours_dip_order_rows(req: AfterHoursDipOrderRequest, universe: str) -> Dict[str, Any]:
+    signals_req = SignalsRequest(
+        universe=universe,
+        horizon=req.horizon,
+        tickers=req.tickers,
+        refresh=False,
+        limit=req.limit,
+        min_price=req.min_price,
+        min_volume=req.min_volume,
+    )
+
+    base_block = await build_signal_rows(signals_req, universe)
+
+    payload = {
+        "horizon": req.horizon,
+        "polygon_enabled": bool(POLYGON_API_KEY),
+        "cache": cache_status(),
+        "universes": [base_block],
+    }
+
+    if req.include_news_catalysts and "enrich_payload_with_news_catalysts" in globals():
+        payload = await enrich_payload_with_news_catalysts(payload)
+
+    block = payload.get("universes", [{}])[0]
+    for sig in block.get("signals", []) or []:
+        sig["after_hours_dip_order_plan"] = compute_after_hours_dip_order_plan(sig, req)
+
+    signals = block.get("signals", []) or []
+    signals.sort(
+        key=lambda x: (
+            1 if (x.get("after_hours_dip_order_plan") or {}).get("action") == "eligible_for_manual_after_hours_dip_tickets" else 0,
+            safe_float(x.get("technical_plus_news_score") or x.get("overall_score")),
+            safe_float(x.get("intraday_quality_score")),
+        ),
+        reverse=True,
+    )
+
+    block["signals"] = signals[:req.limit]
+    block["returned"] = min(req.limit, len(signals))
+    return block
+
+
+@app.post("/after_hours_dip_orders")
+async def after_hours_dip_orders(req: AfterHoursDipOrderRequest) -> Dict[str, Any]:
+    if not INDEX_MAP and not req.tickers:
+        raise HTTPException(status_code=500, detail="No constituents loaded. Put constituents.json next to main.py or pass explicit tickers.")
+
+    if req.refresh or not cache_is_fresh():
+        await refresh_cache()
+
+    universes = ALL_UNIVERSES if req.universe == "all" else [req.universe]
+
+    payload = {
+        "horizon": req.horizon,
+        "polygon_enabled": bool(POLYGON_API_KEY),
+        "cache": cache_status(),
+        "methodology": {
+            "version": "after_hours_dip_orders_v1",
+            "purpose": "Generate manual Schwab-style limit order tickets for after-hours dip buys.",
+            "inputs": [
+                "live current price",
+                "VWAP",
+                "intraday confirmation",
+                "distance from HOD",
+                "technical score",
+                "news catalyst score",
+                "risk profile",
+                "volume anomaly",
+            ],
+            "risk_controls": [
+                "Limit orders only.",
+                "No market orders.",
+                "No broker submission.",
+                "Can require price above VWAP.",
+                "Can require intraday confirmation.",
+                "Flags low-priced and very-high-risk stocks.",
+            ],
+            "limitations": [
+                "Does not check Schwab symbol eligibility.",
+                "Does not verify live bid/ask spread.",
+                "Does not submit or cancel orders.",
+                "After-hours liquidity may be extremely thin.",
+            ],
+        },
+        "universes": [await build_after_hours_dip_order_rows(req, universe) for universe in universes],
+    }
+
+    all_plans: List[Dict[str, Any]] = []
+    for block in payload.get("universes", []) or []:
+        for sig in block.get("signals", []) or []:
+            plan = sig.get("after_hours_dip_order_plan") or {}
+            all_plans.append({
+                "ticker": sig.get("ticker"),
+                "action": plan.get("action"),
+                "ticket_count": len(plan.get("manual_order_tickets") or []),
+                "warnings": plan.get("warnings") or [],
+                "skip_reasons": plan.get("skip_reasons") or [],
+            })
+
+    payload["after_hours_dip_order_summary"] = {
+        "eligible": [p for p in all_plans if p.get("action") == "eligible_for_manual_after_hours_dip_tickets"],
+        "manual_review": [p for p in all_plans if p.get("action") == "manual_review_small_size_only"],
+        "do_not_place": [p for p in all_plans if p.get("action") == "do_not_place_after_hours_dip_orders"],
+        "important_note": "Review every ticket manually in Schwab. Use limit orders only. This backend does not place live trades.",
+    }
+
+    return payload
+
+
+
+
+
+# -------------------------
+# Compact premarket brief layer
+# -------------------------
+
+class PremarketBriefRequest(BaseModel):
+    universe: Literal["sp500", "dow30", "nasdaq100", "russell2000", "crypto", "watchlist", "all"] = "watchlist"
+    horizon: Literal["1d", "1w", "1mo"] = "1d"
+    tickers: Optional[List[str]] = Field(default=None, description="Optional explicit ticker list")
+    refresh: bool = Field(default=False)
+    limit: int = Field(default=10, ge=1, le=25)
+    min_price: float = Field(default=0.0, ge=0.0)
+    min_volume: float = Field(default=0.0, ge=0.0)
+    min_premarket_volume: float = Field(default=0.0, ge=0.0)
+    include_news_catalysts: bool = Field(default=True)
+
+
+def compact_premarket_signal(sig: Dict[str, Any]) -> Dict[str, Any]:
+    pre = sig.get("premarket", {}) or {}
+    trade = sig.get("trade_plan", {}) or {}
+    news = sig.get("news_catalyst", {}) or {}
+
+    headline = None
+    top_headlines = news.get("top_headlines") or []
+    if top_headlines:
+        h = top_headlines[0] or {}
+        headline = {
+            "title": h.get("title"),
+            "publisher": h.get("publisher"),
+            "published_utc": h.get("published_utc"),
+            "score": h.get("score"),
+            "label": h.get("label"),
+        }
+
+    gap = safe_float(pre.get("gap_pct"))
+    dist_high = safe_float(pre.get("distance_from_premarket_high_pct"))
+    pre_vol = safe_float(pre.get("premarket_volume"))
+
+    if pre.get("premarket_setup") in {"gap_and_hold", "red_to_green_attempt"} and dist_high >= -1.0:
+        action = "watch_opening_range_break"
+    elif pre.get("premarket_setup") == "extended_gap_and_hold":
+        action = "wait_for_pullback_or_opening_range_break"
+    elif pre.get("premarket_setup") in {"gap_and_fade", "premarket_exhaustion"}:
+        action = "avoid_at_open"
+    elif gap > 0 and pre_vol > 0:
+        action = "wait_for_open_confirmation"
+    else:
+        action = "watch_only"
+
+    return {
+        "ticker": sig.get("ticker"),
+        "action": action,
+        "premarket_price": pre.get("premarket_price"),
+        "gap_pct": pre.get("gap_pct"),
+        "premarket_volume": pre.get("premarket_volume"),
+        "premarket_high": pre.get("premarket_high"),
+        "premarket_low": pre.get("premarket_low"),
+        "distance_from_premarket_high_pct": pre.get("distance_from_premarket_high_pct"),
+        "premarket_position_pct": pre.get("premarket_position_pct"),
+        "premarket_setup": pre.get("premarket_setup"),
+        "opening_strategy": pre.get("opening_strategy"),
+        "entry": trade.get("entry"),
+        "entry_basis": trade.get("entry_basis"),
+        "stop": trade.get("stop"),
+        "target_1": trade.get("target_1"),
+        "target_2": trade.get("target_2"),
+        "risk_reward": trade.get("reward_risk_to_target_2"),
+        "invalidates_below": trade.get("invalidates_below"),
+        "overall_score": sig.get("overall_score"),
+        "premarket_quality_score": sig.get("premarket_quality_score"),
+        "news_catalyst_score": news.get("news_catalyst_score", 0),
+        "news_catalyst_label": news.get("news_catalyst_label"),
+        "technical_plus_news_score": sig.get("technical_plus_news_score") or sig.get("overall_score"),
+        "top_headline": headline,
+        "risk_profile": sig.get("risk_profile"),
+        "setup": sig.get("setup"),
+    }
+
+
+async def build_premarket_brief_rows(req: PremarketBriefRequest, universe: str) -> Dict[str, Any]:
+    pre_req = PremarketRequest(
+        universe=universe,
+        horizon=req.horizon,
+        tickers=req.tickers,
+        refresh=False,
+        limit=req.limit,
+        min_price=req.min_price,
+        min_volume=req.min_volume,
+        min_premarket_volume=req.min_premarket_volume,
+    )
+
+    if hasattr(pre_req, "include_news_catalysts"):
+        pre_req.include_news_catalysts = req.include_news_catalysts
+
+    block = await build_premarket_rows(pre_req, universe)
+    signals = block.get("signals", []) or []
+    compact = [compact_premarket_signal(sig) for sig in signals]
+
+    compact.sort(
+        key=lambda x: (
+            safe_float(x.get("technical_plus_news_score")),
+            safe_float(x.get("premarket_quality_score")),
+            safe_float(x.get("premarket_volume")),
+        ),
+        reverse=True,
+    )
+
+    return {
+        "universe": universe,
+        "candidate_count": block.get("candidate_count", len(compact)),
+        "returned": min(req.limit, len(compact)),
+        "signals": compact[:req.limit],
+        "skipped": (block.get("skipped") or [])[:25],
+    }
+
+
+@app.post("/premarket_brief")
+async def premarket_brief(req: PremarketBriefRequest) -> Dict[str, Any]:
+    if not INDEX_MAP and not req.tickers:
+        raise HTTPException(status_code=500, detail="No constituents loaded. Put constituents.json next to main.py or pass explicit tickers.")
+
+    if req.refresh or not cache_is_fresh():
+        await refresh_cache()
+
+    universes = ALL_UNIVERSES if req.universe == "all" else [req.universe]
+    cache = cache_status()
+
+    universe_blocks = [await build_premarket_brief_rows(req, universe) for universe in universes]
+
+    all_rows: List[Dict[str, Any]] = []
+    for block in universe_blocks:
+        all_rows.extend(block.get("signals", []) or [])
+
+    all_rows.sort(
+        key=lambda x: (
+            safe_float(x.get("technical_plus_news_score")),
+            safe_float(x.get("premarket_quality_score")),
+            safe_float(x.get("premarket_volume")),
+        ),
+        reverse=True,
+    )
+
+    return {
+        "horizon": req.horizon,
+        "polygon_enabled": bool(POLYGON_API_KEY),
+        "cache": {
+            "cached": cache.get("cached"),
+            "fresh": cache.get("fresh"),
+            "generated_at": cache.get("generated_at"),
+            "market_date": cache.get("market_date"),
+            "errors": (cache.get("errors") or [])[:5],
+        },
+        "methodology": {
+            "version": "premarket_brief_v1",
+            "purpose": "Compact premarket scan response for GPT Action size limits.",
+        },
+        "universes": universe_blocks,
+        "summary": {
+            "top_candidates": [
+                {
+                    "ticker": r.get("ticker"),
+                    "action": r.get("action"),
+                    "gap_pct": r.get("gap_pct"),
+                    "premarket_volume": r.get("premarket_volume"),
+                    "score": r.get("technical_plus_news_score"),
+                    "news_score": r.get("news_catalyst_score"),
+                }
+                for r in all_rows[:10]
+            ],
+            "avoid_at_open": [
+                r.get("ticker") for r in all_rows
+                if r.get("action") == "avoid_at_open"
+            ][:10],
+        },
+    }
+
+
+
+
 class DailyReportRequest(BaseModel):
     include_news_catalysts: bool = Field(default=True, description="Include separate Polygon news catalyst scoring when available")
     universe: Literal["sp500", "dow30", "nasdaq100", "russell2000", "crypto", "watchlist", "all"] = "sp500"
