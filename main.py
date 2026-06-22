@@ -3220,6 +3220,9 @@ async def premarket_brief(req: PremarketBriefRequest) -> Dict[str, Any]:
             "fresh": cache.get("fresh"),
             "generated_at": cache.get("generated_at"),
             "market_date": cache.get("market_date"),
+            "stale_data_warning": stale.get("stale_data_warning"),
+            "stale_data_reason": stale.get("stale_data_reason"),
+            "market_date_age_calendar_days": stale.get("market_date_age_calendar_days"),
             "errors": (cache.get("errors") or [])[:5],
         },
         "methodology": {
@@ -3252,6 +3255,36 @@ async def premarket_brief(req: PremarketBriefRequest) -> Dict[str, Any]:
 
 BENZINGA_LOOKBACK_HOURS = int(os.getenv("BENZINGA_LOOKBACK_HOURS", "24"))
 BENZINGA_MAX_ROWS = int(os.getenv("BENZINGA_MAX_ROWS", "10"))
+
+
+def compute_stale_data_warning(cache: Dict[str, Any]) -> Dict[str, Any]:
+    market_date = cache.get("market_date")
+    generated_at = cache.get("generated_at")
+    age_days = None
+    warning = False
+    reason = None
+    try:
+        md = datetime.strptime(str(market_date)[:10], "%Y-%m-%d").date() if market_date else None
+        if generated_at:
+            gd = datetime.fromisoformat(str(generated_at).replace("Z", "+00:00")).date()
+        else:
+            gd = datetime.now(timezone.utc).date()
+        if md:
+            age_days = (gd - md).days
+            if age_days > 3:
+                warning = True
+                reason = f"Polygon grouped market_date is {age_days} calendar days behind generated_at. Verify live/pre-market prices before trading."
+    except Exception:
+        pass
+    errors = cache.get("errors") or []
+    if any("No grouped stock rows returned" in str(e) for e in errors) and age_days is not None and age_days > 1:
+        warning = True
+        reason = reason or "Polygon grouped rows were unavailable for at least one recent date. Verify freshness before trading."
+    return {
+        "stale_data_warning": warning,
+        "stale_data_reason": reason,
+        "market_date_age_calendar_days": age_days,
+    }
 
 
 def benzinga_extract_rows(data: Any) -> List[Dict[str, Any]]:
@@ -3353,6 +3386,88 @@ def benzinga_row_mentions_ticker(row: Dict[str, Any], ticker: str) -> bool:
 
 def filter_benzinga_rows_for_ticker(rows: List[Dict[str, Any]], ticker: str) -> List[Dict[str, Any]]:
     return [row for row in rows if benzinga_row_mentions_ticker(row, ticker)]
+
+
+TICKER_COMPANY_HINTS = {
+    "AAPL": ["APPLE"],
+    "TSLA": ["TESLA"],
+    "CAT": ["CATERPILLAR"],
+    "JPM": ["JPMORGAN", "JP MORGAN", "J.P. MORGAN"],
+    "MRK": ["MERCK"],
+    "INTC": ["INTEL"],
+    "UNH": ["UNITEDHEALTH", "UNITED HEALTH", "UNITEDHEALTH GROUP"],
+    "ADI": ["ANALOG DEVICES"],
+    "KLAC": ["KLA", "KLA CORP", "KLA CORPORATION"],
+    "LRCX": ["LAM RESEARCH"],
+    "DFLI": ["DRAGONFLY", "DRAGONFLY ENERGY"],
+    "KRKNF": ["KRAKEN", "KRAKEN ROBOTICS"],
+}
+
+
+def benzinga_text_blob(row: Dict[str, Any]) -> str:
+    parts = []
+    for key in ["title", "headline", "teaser", "body", "description", "comments"]:
+        val = row.get(key)
+        if val:
+            parts.append(str(val))
+    return " ".join(parts)
+
+
+def benzinga_row_is_direct_news(row: Dict[str, Any], ticker: str) -> bool:
+    """Return True when a news/WIIM row is directly about the ticker.
+
+    Benzinga news can include a ticker in the stocks metadata for broad sector/market
+    stories. Those are useful context, but they should not become the top headline or
+    score as a ticker-specific catalyst unless the headline/teaser/body directly names
+    the ticker or a known company name.
+    """
+    ticker = normalize_ticker(ticker)
+    if not row or not ticker:
+        return False
+    text = benzinga_text_blob(row).upper()
+    if re.search(rf"\b{re.escape(ticker)}\b", text):
+        return True
+    for hint in TICKER_COMPANY_HINTS.get(ticker, []):
+        if hint and hint.upper() in text:
+            return True
+    return False
+
+
+def filter_direct_news_rows(rows: List[Dict[str, Any]], ticker: str) -> List[Dict[str, Any]]:
+    return [row for row in rows if benzinga_row_is_direct_news(row, ticker)]
+
+
+def benzinga_row_date(row: Dict[str, Any]) -> Optional[datetime]:
+    for key in ["date", "created", "updated", "time", "event_date", "report_date", "announced", "announce_date"]:
+        if row.get(key):
+            dt = parse_benzinga_date(row.get(key))
+            if dt:
+                return dt
+    return None
+
+
+def benzinga_row_is_current_event(row: Dict[str, Any], past_days: int = 5, future_days: int = 30) -> bool:
+    dt = benzinga_row_date(row)
+    if not dt:
+        return False
+    delta = (dt.date() - datetime.now(timezone.utc).date()).days
+    return -past_days <= delta <= future_days
+
+
+def mna_row_has_explicit_role(row: Dict[str, Any], ticker: str) -> bool:
+    ticker = normalize_ticker(ticker)
+    if not ticker or not row:
+        return False
+    role_fields = [
+        "acquirer_ticker", "target_ticker", "acquirer", "target", "buyer_ticker",
+        "seller_ticker", "company_ticker", "deal_ticker",
+    ]
+    for key in role_fields:
+        if key in row:
+            for candidate in _split_symbol_list(row.get(key)):
+                if str(candidate or "").upper().strip() == ticker:
+                    return True
+    return False
 
 
 async def benzinga_raw_get(
@@ -3498,17 +3613,18 @@ def score_rows_text(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         "negative_terms": sorted(set(matched_neg))[:8],
     }
 
-def summarize_news_rows(ticker: str, rows: List[Dict[str, Any]]) -> Dict[str, Any]:
-    rows = rows[:BENZINGA_MAX_ROWS]
-    scoring = score_rows_text(rows)
-    top = rows[0] if rows else {}
+def summarize_news_rows(ticker: str, rows: List[Dict[str, Any]], *, context_rows: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+    direct_rows = rows[:BENZINGA_MAX_ROWS]
+    context_rows = (context_rows or rows)[:BENZINGA_MAX_ROWS]
+    scoring = score_rows_text(direct_rows)
+    top = direct_rows[0] if direct_rows else {}
     channels = [str(c.get("name") or c) for c in (top.get("channels") or []) if c]
-    title = top.get("title") if rows else None
-    created = top.get("created") or top.get("updated") if rows else None
+    title = top.get("title") if direct_rows else None
+    created = (top.get("created") or top.get("updated")) if direct_rows else None
     recency = minutes_since_benzinga_time(created)
 
     one_hour_count = 0
-    for row in rows:
+    for row in context_rows:
         mins = minutes_since_benzinga_time(row.get("created") or row.get("updated"))
         if mins is not None and mins <= 60:
             one_hour_count += 1
@@ -3517,29 +3633,37 @@ def summarize_news_rows(ticker: str, rows: List[Dict[str, Any]]) -> Dict[str, An
         "news_catalyst_score": scoring["score"],
         "news_catalyst_label": scoring["label"],
         "top_headline": title,
-        "top_headline_url": top.get("url") if rows else None,
+        "top_headline_url": top.get("url") if direct_rows else None,
         "headline_count_1h": one_hour_count,
-        "headline_count_24h": len(rows),
+        "headline_count_24h": len(context_rows),
         "news_recency_minutes": recency,
         "catalyst_type": classify_catalyst_type(str(title or ""), channels),
         "channels": channels[:5],
-        "importance_rank": top.get("importance_rank") if rows else None,
+        "importance_rank": top.get("importance_rank") if direct_rows else None,
         "positive_terms": scoring["positive_terms"],
         "negative_terms": scoring["negative_terms"],
+        "direct_headline_count_24h": len(direct_rows),
+        "broad_context_headline_count_24h": max(0, len(context_rows) - len(direct_rows)),
     }
 
 
-def summarize_wiim_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+def summarize_wiim_rows(ticker: str, rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     rows = rows[:5]
     if not rows:
-        return {"why_moving": None, "wiim_catalyst_type": None, "wiim_score": 0}
-    top = rows[0]
-    title = str(top.get("title") or top.get("teaser") or "")
-    scoring = score_rows_text(rows)
+        return {"why_moving": None, "wiim_catalyst_type": None, "wiim_score": 0, "wiim_is_ticker_specific": False}
+
+    direct_rows = filter_direct_news_rows(rows, ticker)
+    chosen = direct_rows[0] if direct_rows else rows[0]
+    title = str(chosen.get("title") or chosen.get("teaser") or "")
+    is_direct = bool(direct_rows)
+    scoring = score_rows_text(direct_rows if direct_rows else [])
+    # Broad sector WIIM is useful context, but should not be scored as a ticker catalyst.
+    score = scoring["score"] if is_direct else 0
     return {
         "why_moving": title[:240] if title else None,
-        "wiim_catalyst_type": classify_catalyst_type(title, [str(c.get("name") or c) for c in (top.get("channels") or [])]),
-        "wiim_score": scoring["score"],
+        "wiim_catalyst_type": classify_catalyst_type(title, [str(c.get("name") or c) for c in (chosen.get("channels") or [])]),
+        "wiim_score": score,
+        "wiim_is_ticker_specific": is_direct,
     }
 
 
@@ -3676,7 +3800,7 @@ def benzinga_event_is_near(value: Any, max_days: int) -> bool:
     days = days_until_benzinga_date(value)
     return days is not None and 0 <= days <= max_days
 
-def summarize_calendar_rows(rows: List[Dict[str, Any]], kind: str) -> Dict[str, Any]:
+def summarize_calendar_rows(rows: List[Dict[str, Any]], kind: str, ticker: Optional[str] = None) -> Dict[str, Any]:
     has = bool(rows)
     top = rows[0] if rows else {}
     blob = json.dumps(top, default=str).lower()
@@ -3726,11 +3850,16 @@ def summarize_calendar_rows(rows: List[Dict[str, Any]], kind: str) -> Dict[str, 
         }
 
     if kind == "offerings":
+        # Offerings are only actionable if the row is ticker-specific and current/recent.
+        # Do not penalize large-cap names for stale or broad offering-calendar rows.
+        actionable_rows = [r for r in rows if benzinga_row_is_current_event(r, past_days=7, future_days=14)]
+        actionable = bool(actionable_rows)
+        top2 = actionable_rows[0] if actionable_rows else top
         return {
-            "offering_flag": has,
-            "offering_price": top.get("price") or top.get("offering_price"),
-            "offering_proceeds": top.get("proceeds") or top.get("amount"),
-            "dilution_risk_score": 80 if has else 0,
+            "offering_flag": actionable,
+            "offering_price": top2.get("price") or top2.get("offering_price"),
+            "offering_proceeds": top2.get("proceeds") or top2.get("amount"),
+            "dilution_risk_score": 80 if actionable else 0,
         }
 
     if kind == "fda":
@@ -3749,9 +3878,10 @@ def summarize_calendar_rows(rows: List[Dict[str, Any]], kind: str) -> Dict[str, 
         status_text = str(status or "").lower()
         deal_price = top.get("deal_price") or top.get("price")
         deal_value = top.get("deal_value") or top.get("value")
-        # Rumors are context, not automatic risk. Only hard-flag announced/definitive/pending
-        # transactions or rows with deal price/value.
-        actionable_mna = has and (
+        # M&A should only become a risk flag when the ticker is explicitly the acquirer/target
+        # and the transaction is real/actionable. Broad M&A-calendar mentions are context only.
+        role_match = bool(ticker and any(mna_row_has_explicit_role(r, ticker) for r in rows))
+        actionable_mna = has and role_match and (
             any(x in status_text for x in ["announced", "definitive", "pending", "completed"])
             or bool(deal_price)
             or bool(deal_value)
@@ -3844,31 +3974,37 @@ async def fetch_benzinga_catalyst_summary(
         return rows
 
     # Core catalyst endpoints. Keep limits compact to avoid slow scans.
-    news_rows = await get_rows("/api/v2/news", {"tickers": ticker, "pageSize": 10, "displayOutput": "abstract"})
-    wiim_rows = await get_rows("/api/v2/news", {"tickers": ticker, "pageSize": 5, "displayOutput": "abstract", "channels": "WIIM"})
+    # News/WIIM are first filtered by Benzinga stock metadata, then tightened again
+    # to direct ticker/company mentions for scoring and top-headline selection.
+    news_context_rows = await get_rows("/api/v2/news", {"tickers": ticker, "pageSize": 10, "displayOutput": "abstract"})
+    wiim_context_rows = await get_rows("/api/v2/news", {"tickers": ticker, "pageSize": 5, "displayOutput": "abstract", "channels": "WIIM"})
+    news_rows = filter_direct_news_rows(news_context_rows, ticker)
+    wiim_rows = wiim_context_rows
     nq_rows = await get_rows("/api/v2/newsquantified", {"tickers": ticker, "limit": 10})
     ratings_rows = await get_rows("/api/v2.1/calendar/ratings", {"tickers": ticker, "limit": 10})
     earnings_rows = await get_rows("/api/v2.1/calendar/earnings", {"tickers": ticker, "limit": 5}) if include_risk_events else []
     guidance_rows = await get_rows("/api/v2.1/calendar/guidance", {"tickers": ticker, "limit": 5}) if include_risk_events else []
-    offerings_rows = await get_rows("/api/v2.1/calendar/offerings", {"tickers": ticker, "limit": 5}) if include_risk_events else []
+    offerings_rows_raw = await get_rows("/api/v2.1/calendar/offerings", {"tickers": ticker, "limit": 5}) if include_risk_events else []
+    offerings_rows = [r for r in offerings_rows_raw if benzinga_row_is_current_event(r, past_days=7, future_days=14)]
     fda_rows = await get_rows("/api/v2.1/calendar/fda", {"tickers": ticker, "limit": 5}) if include_risk_events else []
-    mna_rows = await get_rows("/api/v2.1/calendar/ma", {"tickers": ticker, "limit": 5}) if include_risk_events else []
+    mna_rows_raw = await get_rows("/api/v2.1/calendar/ma", {"tickers": ticker, "limit": 5}) if include_risk_events else []
+    mna_rows = [r for r in mna_rows_raw if mna_row_has_explicit_role(r, ticker)]
     halt_rows = await get_rows("/api/v1/signal/halt_resume", {"tickers": ticker, "limit": 5}) if include_risk_events else []
     short_rows = await get_rows("/api/v1/shortinterest", {"symbols": ticker, "limit": 5}) if include_risk_events else []
     insider_rows = await get_rows("/api/v1/sec/insider_transactions/transactions", {"tickers": ticker, "limit": 10}) if include_risk_events else []
     block_rows = await get_rows("/api/v1/signal/block_trade", {"tickers": ticker, "limit": 10})
     option_rows = await get_rows("/api/v1/signal/option_activity", {"tickers": ticker, "limit": 20}) if include_options_flow else []
 
-    news = summarize_news_rows(ticker, news_rows)
-    wiim = summarize_wiim_rows(wiim_rows)
+    news = summarize_news_rows(ticker, news_rows, context_rows=news_context_rows)
+    wiim = summarize_wiim_rows(ticker, wiim_rows)
     nq = summarize_newsquantified_rows(nq_rows)
     options = summarize_options_activity(option_rows)
     analyst = summarize_calendar_rows(ratings_rows, "ratings")
     earnings = summarize_calendar_rows(earnings_rows, "earnings")
     guidance = summarize_calendar_rows(guidance_rows, "guidance")
-    offerings = summarize_calendar_rows(offerings_rows, "offerings")
+    offerings = summarize_calendar_rows(offerings_rows, "offerings", ticker)
     fda = summarize_calendar_rows(fda_rows, "fda")
-    mna = summarize_calendar_rows(mna_rows, "mna")
+    mna = summarize_calendar_rows(mna_rows, "mna", ticker)
     halts = summarize_calendar_rows(halt_rows, "halts")
     short_interest = summarize_short_interest(short_rows)
     insider = summarize_insider_rows(insider_rows)
@@ -4202,6 +4338,7 @@ async def premarket_recommendations(req: PremarketRecommendationRequest) -> Dict
 
     universes = ALL_UNIVERSES if req.universe == "all" else [req.universe]
     cache = cache_status()
+    stale = compute_stale_data_warning(cache)
     universe_blocks = [await build_premarket_recommendation_rows(req, universe) for universe in universes]
 
     all_rows: List[Dict[str, Any]] = []
@@ -4220,10 +4357,13 @@ async def premarket_recommendations(req: PremarketRecommendationRequest) -> Dict
             "fresh": cache.get("fresh"),
             "generated_at": cache.get("generated_at"),
             "market_date": cache.get("market_date"),
+            "stale_data_warning": stale.get("stale_data_warning"),
+            "stale_data_reason": stale.get("stale_data_reason"),
+            "market_date_age_calendar_days": stale.get("market_date_age_calendar_days"),
             "errors": (cache.get("errors") or [])[:5],
         },
         "methodology": {
-            "version": "premarket_recommendations_benzinga_v2",
+            "version": "premarket_recommendations_benzinga_v2_3",
             "purpose": "Compact premarket recommendations using Polygon technicals plus Benzinga catalysts, options flow, analyst actions, and risk events.",
             "benzinga_sources": [
                 "news", "wiim", "newsquantified", "unusual_options", "market_movers",
