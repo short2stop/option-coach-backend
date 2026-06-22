@@ -3455,18 +3455,34 @@ def benzinga_row_is_current_event(row: Dict[str, Any], past_days: int = 5, futur
 
 
 def mna_row_has_explicit_role(row: Dict[str, Any], ticker: str) -> bool:
+    """Strict M&A role check.
+
+    Benzinga M&A rows may include broad ticker metadata or company-name text. For
+    trading-risk purposes, only treat M&A as actionable when the row explicitly
+    names the requested ticker in an acquirer/target/buyer/seller ticker or symbol
+    field. Generic fields like ``ticker``/``tickers`` or company names are context,
+    not enough to create an M&A risk flag.
+    """
     ticker = normalize_ticker(ticker)
-    if not ticker or not row:
+    if not ticker or not isinstance(row, dict):
         return False
-    role_fields = [
-        "acquirer_ticker", "target_ticker", "acquirer", "target", "buyer_ticker",
-        "seller_ticker", "company_ticker", "deal_ticker",
+
+    strict_role_fields = [
+        "acquirer_ticker", "target_ticker", "buyer_ticker", "seller_ticker",
+        "parent_ticker", "company_ticker", "deal_ticker", "acquired_ticker",
+        "acquirer_symbol", "target_symbol", "buyer_symbol", "seller_symbol",
+        "parent_symbol", "company_symbol",
     ]
-    for key in role_fields:
-        if key in row:
-            for candidate in _split_symbol_list(row.get(key)):
-                if str(candidate or "").upper().strip() == ticker:
-                    return True
+    for key in strict_role_fields:
+        if key not in row:
+            continue
+        val = row.get(key)
+        # Do not let company names like "JPMorgan Chase" or "Caterpillar"
+        # count here. These fields must carry ticker-like symbols.
+        for candidate in _split_symbol_list(val):
+            c = str(candidate or "").upper().strip()
+            if c == ticker:
+                return True
     return False
 
 
@@ -3874,18 +3890,27 @@ def summarize_calendar_rows(rows: List[Dict[str, Any]], kind: str, ticker: Optio
         }
 
     if kind == "mna":
-        status = top.get("deal_status") or top.get("status")
-        status_text = str(status or "").lower()
-        deal_price = top.get("deal_price") or top.get("price")
-        deal_value = top.get("deal_value") or top.get("value")
-        # M&A should only become a risk flag when the ticker is explicitly the acquirer/target
-        # and the transaction is real/actionable. Broad M&A-calendar mentions are context only.
-        role_match = bool(ticker and any(mna_row_has_explicit_role(r, ticker) for r in rows))
-        actionable_mna = has and role_match and (
-            any(x in status_text for x in ["announced", "definitive", "pending", "completed"])
-            or bool(deal_price)
-            or bool(deal_value)
-        )
+        # M&A risk must be much stricter than news context. Only use rows where
+        # the ticker is explicitly listed in an acquirer/target/buyer/seller ticker
+        # or symbol field. Broad M&A calendar rows should not distort premarket
+        # technicals for every Dow/S&P name.
+        actionable_statuses = ["announced", "definitive", "pending", "completed", "active"]
+        strict_rows = [r for r in rows if ticker and mna_row_has_explicit_role(r, ticker)]
+        actionable_rows: List[Dict[str, Any]] = []
+        for r in strict_rows:
+            status_text = str(r.get("deal_status") or r.get("status") or "").lower()
+            deal_price = r.get("deal_price") or r.get("price")
+            deal_value = r.get("deal_value") or r.get("value")
+            status_ok = any(x in status_text for x in actionable_statuses)
+            dated_ok = benzinga_row_is_current_event(r, past_days=30, future_days=180) or bool(deal_price) or bool(deal_value)
+            if status_ok and dated_ok:
+                actionable_rows.append(r)
+
+        top2 = actionable_rows[0] if actionable_rows else (strict_rows[0] if strict_rows else {})
+        status = top2.get("deal_status") or top2.get("status") if top2 else None
+        deal_price = top2.get("deal_price") or top2.get("price") if top2 else None
+        deal_value = top2.get("deal_value") or top2.get("value") if top2 else None
+        actionable_mna = bool(actionable_rows)
         return {
             "mna_flag": actionable_mna,
             "deal_status": status,
@@ -4363,7 +4388,7 @@ async def premarket_recommendations(req: PremarketRecommendationRequest) -> Dict
             "errors": (cache.get("errors") or [])[:5],
         },
         "methodology": {
-            "version": "premarket_recommendations_benzinga_v2_3",
+            "version": "premarket_recommendations_benzinga_v2_4",
             "purpose": "Compact premarket recommendations using Polygon technicals plus Benzinga catalysts, options flow, analyst actions, and risk events.",
             "benzinga_sources": [
                 "news", "wiim", "newsquantified", "unusual_options", "market_movers",
