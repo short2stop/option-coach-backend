@@ -883,7 +883,8 @@ BENZINGA_CAPABILITY_TESTS: Dict[str, Dict[str, Any]] = {
         "ticker_param": "tickers",
     },
     "halts": {
-        "path": "/api/v2.1/calendar/halts",
+        # Retest with likely signal/calendar halt variants in /test_benzinga_failed_capabilities.
+        "path": "/api/v1/signal/halt",
         "params": {"limit": 3},
         "ticker_param": "tickers",
     },
@@ -908,21 +909,65 @@ BENZINGA_CAPABILITY_TESTS: Dict[str, Dict[str, Any]] = {
         "ticker_param": "tickers",
     },
     "short_interest": {
-        "path": "/api/v1/short-interest",
+        "path": "/api/v1/shortinterest",
         "params": {"limit": 3},
         "ticker_param": "symbols",
     },
     "insider_transactions": {
-        "path": "/api/v1/sec/insider-transactions",
+        "path": "/api/v1/sec/insider_transactions/transactions",
         "params": {"limit": 3},
         "ticker_param": "tickers",
     },
     "government_trades": {
-        "path": "/api/v1/government-trades",
+        "path": "/api/v1/government_trades",
         "params": {"limit": 3},
         "ticker_param": "tickers",
     },
 }
+
+
+# Step 2B: expanded retest paths for the four APIs that initially failed.
+# This endpoint is intentionally diagnostic only; it does not change recommendations.
+BENZINGA_FAILED_CAPABILITY_RETESTS: Dict[str, List[Dict[str, Any]]] = {
+    "halts": [
+        {"path": "/api/v1/signal/halt", "params": {"limit": 3}, "ticker_param": "tickers"},
+        {"path": "/api/v1/signal/halts", "params": {"limit": 3}, "ticker_param": "tickers"},
+        {"path": "/api/v1/signal/halt_resume", "params": {"limit": 3}, "ticker_param": "tickers"},
+        {"path": "/api/v2.1/calendar/halt", "params": {"limit": 3}, "ticker_param": "tickers"},
+        {"path": "/api/v2.1/calendar/halts", "params": {"limit": 3}, "ticker_param": "tickers"},
+    ],
+    "short_interest": [
+        {"path": "/api/v1/shortinterest", "params": {"limit": 3}, "ticker_param": "symbols"},
+        {"path": "/api/v1/shortinterest", "params": {"limit": 3}, "ticker_param": "symbol"},
+        {"path": "/api/v1/short_interest", "params": {"limit": 3}, "ticker_param": "symbols"},
+        {"path": "/api/v1/short-interest", "params": {"limit": 3}, "ticker_param": "symbols"},
+    ],
+    "insider_transactions": [
+        {"path": "/api/v1/sec/insider_transactions/transactions", "params": {"limit": 3}, "ticker_param": "tickers"},
+        {"path": "/api/v1/sec/insider_transactions/filings", "params": {"limit": 3}, "ticker_param": "tickers"},
+        {"path": "/api/v1/sec/insider_transactions/owners", "params": {"limit": 3}, "ticker_param": "tickers"},
+        {"path": "/api/v1/sec/insider-transactions", "params": {"limit": 3}, "ticker_param": "tickers"},
+    ],
+    "government_trades": [
+        {"path": "/api/v1/government_trades", "params": {"limit": 3}, "ticker_param": "tickers"},
+        {"path": "/api/v1/government_trades/house", "params": {"limit": 3}, "ticker_param": "tickers"},
+        {"path": "/api/v1/government_trades/senate", "params": {"limit": 3}, "ticker_param": "tickers"},
+        {"path": "/api/v1/government-trades", "params": {"limit": 3}, "ticker_param": "tickers"},
+    ],
+}
+
+
+def choose_best_benzinga_attempt(attempts: List[Dict[str, Any]]) -> Dict[str, Any]:
+    if not attempts:
+        return {}
+    for status in ["enabled_with_data", "reachable_no_data", "rate_limited"]:
+        for attempt in attempts:
+            if attempt.get("status") == status:
+                return attempt
+    for attempt in attempts:
+        if attempt.get("enabled"):
+            return attempt
+    return attempts[0]
 
 
 async def fetch_benzinga_news_for_ticker(ticker: str, page_size: int = 5) -> Dict[str, Any]:
@@ -1085,6 +1130,75 @@ async def test_benzinga_capabilities(ticker: str = "NVDA") -> Dict[str, Any]:
         "note": (
             "This is a smoke test. 'reachable_no_data' means the endpoint returned HTTP 200 "
             "but no rows for the test request; it may still be usable with different filters."
+        ),
+    }
+
+
+@app.get("/test_benzinga_failed_capabilities")
+async def test_benzinga_failed_capabilities(ticker: str = "AAPL") -> Dict[str, Any]:
+    """Retest the four Benzinga APIs that failed in the first capability smoke test.
+
+    This tries multiple likely URL/path variants for each API and returns every attempt
+    plus the best working candidate. It does not expose the API key.
+    """
+    ticker = normalize_ticker(ticker)
+    if not BENZINGA_API_KEY:
+        return {
+            "benzinga_api_key_loaded": False,
+            "ticker": ticker,
+            "retests": {},
+            "recovered": [],
+            "still_disabled": list(BENZINGA_FAILED_CAPABILITY_RETESTS.keys()),
+            "note": "BENZINGA_API_KEY is not loaded in this Render service.",
+        }
+
+    output: Dict[str, Any] = {}
+    timeout = BENZINGA_TIMEOUT
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        for capability, candidates in BENZINGA_FAILED_CAPABILITY_RETESTS.items():
+            attempts: List[Dict[str, Any]] = []
+            for cfg in candidates:
+                params = dict(cfg.get("params") or {})
+                ticker_param = cfg.get("ticker_param")
+                if ticker_param:
+                    params[ticker_param] = ticker
+                result = await benzinga_get(client, cfg["path"], params=params)
+                summary = result.get("summary") or {}
+                attempts.append({
+                    "path": cfg.get("path"),
+                    "ticker_param": ticker_param,
+                    "enabled": bool(result.get("enabled")),
+                    "status": result.get("status"),
+                    "status_code": result.get("status_code"),
+                    "record_count": summary.get("record_count"),
+                    "data_type": summary.get("data_type"),
+                    "sample_keys": summary.get("sample_keys"),
+                    "error": result.get("error"),
+                })
+                await asyncio.sleep(0.05)
+
+            best = choose_best_benzinga_attempt(attempts)
+            output[capability] = {
+                "best_enabled": bool(best.get("enabled")),
+                "best_status": best.get("status"),
+                "best_path": best.get("path"),
+                "best_ticker_param": best.get("ticker_param"),
+                "best_record_count": best.get("record_count"),
+                "attempts": attempts,
+            }
+
+    recovered = [k for k, v in output.items() if v.get("best_enabled")]
+    still_disabled = [k for k, v in output.items() if not v.get("best_enabled")]
+
+    return {
+        "benzinga_api_key_loaded": True,
+        "ticker": ticker,
+        "retests": output,
+        "recovered": recovered,
+        "still_disabled": still_disabled,
+        "note": (
+            "Use best_path values that show enabled or reachable_no_data in the next integration. "
+            "reachable_no_data means the endpoint exists but did not return rows for this ticker/window."
         ),
     }
 
