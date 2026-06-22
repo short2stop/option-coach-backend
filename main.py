@@ -4261,7 +4261,13 @@ def compact_premarket_recommendation(sig: Dict[str, Any]) -> Dict[str, Any]:
     benz_score = safe_float(benz.get("final_benzinga_score"))
 
     # Penalty for major risk flags.
-    risk_flags = list(benz.get("risk_flags") or [])
+    # v2.6: M&A remains available in /benzinga_catalyst for research,
+    # but is disabled for /premarket_recommendations because Benzinga M&A
+    # rows were still producing broad false positives on large-cap names.
+    risk_flags = [
+        f for f in list(benz.get("risk_flags") or [])
+        if "M&A" not in str(f) and "deal event" not in str(f)
+    ]
     penalty = 0.0
     if any("Offering" in f for f in risk_flags):
         penalty += 25
@@ -4311,7 +4317,8 @@ def compact_premarket_recommendation(sig: Dict[str, Any]) -> Dict[str, Any]:
         "offering_flag": benz.get("offering_flag", False),
         "halt_flag": benz.get("halt_flag", False),
         "fda_event_risk": benz.get("fda_event_risk", False),
-        "mna_flag": benz.get("mna_flag", False),
+        # v2.6: suppress M&A in production premarket recommendations.
+        "mna_flag": False,
         "short_squeeze_score": benz.get("short_squeeze_score", 0),
         "insider_activity_score": benz.get("insider_activity_score", 0),
         "why_moving": benz.get("why_moving"),
@@ -4415,7 +4422,7 @@ async def premarket_recommendations(req: PremarketRecommendationRequest) -> Dict
             "errors": (cache.get("errors") or [])[:5],
         },
         "methodology": {
-            "version": "premarket_recommendations_benzinga_v2_5",
+            "version": "premarket_recommendations_benzinga_v2_6",
             "purpose": "Compact premarket recommendations using Polygon technicals plus Benzinga catalysts, options flow, analyst actions, and risk events.",
             "benzinga_sources": [
                 "news", "wiim", "newsquantified", "unusual_options", "market_movers",
