@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from email.utils import parsedate_to_datetime
 
 import httpx
 from fastapi import FastAPI, HTTPException
@@ -3243,6 +3244,851 @@ async def premarket_brief(req: PremarketBriefRequest) -> Dict[str, Any]:
             ][:10],
         },
     }
+
+# -------------------------
+# Benzinga catalyst + premarket recommendation layer v2
+# -------------------------
+
+BENZINGA_LOOKBACK_HOURS = int(os.getenv("BENZINGA_LOOKBACK_HOURS", "24"))
+BENZINGA_MAX_ROWS = int(os.getenv("BENZINGA_MAX_ROWS", "10"))
+
+
+def benzinga_extract_rows(data: Any) -> List[Dict[str, Any]]:
+    """Extract the likely row list from common Benzinga response shapes."""
+    if isinstance(data, list):
+        return [x for x in data if isinstance(x, dict)]
+    if isinstance(data, dict):
+        for key in [
+            "data", "results", "items", "news", "ratings", "earnings", "guidance",
+            "offerings", "fda", "ma", "dividends", "splits", "option_activity",
+            "shortInterestData", "insider_transactions", "transactions", "block_trades",
+            "blocks", "result", "halt_resume", "halts",
+        ]:
+            val = data.get(key)
+            if isinstance(val, list):
+                return [x for x in val if isinstance(x, dict)]
+            if isinstance(val, dict):
+                # Movers often wrap another list under result.*
+                nested = benzinga_extract_rows(val)
+                if nested:
+                    return nested
+        # If it is a single object, keep it as one row.
+        if data:
+            return [data]
+    return []
+
+
+async def benzinga_raw_get(
+    client: httpx.AsyncClient,
+    path: str,
+    params: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Internal Benzinga GET wrapper that returns parsed data for scoring.
+
+    Never expose this raw payload directly to GPT Action responses.
+    """
+    if not BENZINGA_API_KEY:
+        return {"ok": False, "status_code": None, "error": "BENZINGA_API_KEY is not loaded", "data": None}
+
+    query = dict(params or {})
+    query["token"] = BENZINGA_API_KEY
+    url = f"{BENZINGA_BASE}{path}"
+
+    try:
+        resp = await client.get(url, params=query, headers={"accept": "application/json"})
+    except Exception as e:
+        return {"ok": False, "status_code": None, "error": str(e), "data": None}
+
+    if resp.status_code < 200 or resp.status_code >= 300:
+        return {"ok": False, "status_code": resp.status_code, "error": resp.text[:200], "data": None}
+
+    try:
+        data = resp.json()
+    except Exception:
+        data = resp.text.strip()
+
+    return {"ok": True, "status_code": resp.status_code, "error": None, "data": data}
+
+
+def minutes_since_benzinga_time(value: Any) -> Optional[int]:
+    if not value:
+        return None
+    try:
+        dt = parsedate_to_datetime(str(value))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        mins = (datetime.now(timezone.utc) - dt.astimezone(timezone.utc)).total_seconds() / 60
+        return max(0, int(mins))
+    except Exception:
+        return None
+
+
+def classify_catalyst_type(text: str, channels: List[str]) -> str:
+    blob = f"{text} {' '.join(channels)}".lower()
+    if any(x in blob for x in ["rating", "upgrade", "downgrade", "price target", "analyst"]):
+        return "analyst"
+    if any(x in blob for x in ["earnings", "eps", "revenue", "guidance"]):
+        return "earnings"
+    if any(x in blob for x in ["fda", "pdufa", "clinical", "trial", "approval"]):
+        return "fda"
+    if any(x in blob for x in ["merger", "acquisition", "m&a", "buyout", "deal"]):
+        return "mna"
+    if any(x in blob for x in ["offering", "dilution", "shelf", "warrant"]):
+        return "offering"
+    if any(x in blob for x in ["lawsuit", "investigation", "legal"]):
+        return "legal"
+    if any(x in blob for x in ["product", "launch", "partnership", "contract", "order"]):
+        return "product_contract"
+    if any(x in blob for x in ["cpi", "fed", "inflation", "rates", "macro"]):
+        return "macro"
+    return "news" if text.strip() else "none"
+
+
+def score_rows_text(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    if not rows:
+        return {"score": 0.0, "label": "no_data", "positive_terms": [], "negative_terms": []}
+
+    positive_terms = [
+        "upgrade", "upgraded", "price target raised", "raises price target", "raises guidance",
+        "beats", "beat", "earnings beat", "contract", "partnership", "fda approval",
+        "approval", "buy rating", "strong demand", "record revenue", "launches", "winner",
+        "long ideas", "surges", "jumps", "rallies", "acquisition", "order", "selected",
+    ]
+    negative_terms = [
+        "downgrade", "downgraded", "price target cut", "cuts price target", "cuts guidance",
+        "misses", "miss", "offering", "dilution", "lawsuit", "investigation", "bankruptcy",
+        "sell rating", "trading lower", "turnaround taking longer", "halt", "delisting",
+        "loss widens", "revenue falls", "recall",
+    ]
+
+    raw = 0.0
+    matched_pos: List[str] = []
+    matched_neg: List[str] = []
+    for i, row in enumerate(rows[:BENZINGA_MAX_ROWS]):
+        title = str(row.get("title") or row.get("headline") or row.get("teaser") or "")
+        body = str(row.get("body") or row.get("description") or row.get("comments") or "")
+        blob = f"{title} {body}".lower()
+        weight = max(1.0, BENZINGA_MAX_ROWS - i) / BENZINGA_MAX_ROWS
+        for term in positive_terms:
+            if term in blob:
+                raw += 12 * weight
+                matched_pos.append(term)
+        for term in negative_terms:
+            if term in blob:
+                raw -= 15 * weight
+                matched_neg.append(term)
+
+        importance = safe_float(row.get("importance_rank"))
+        if importance >= 2:
+            raw += 3 * weight
+
+    score = clamp(50 + raw)
+    if score >= 75:
+        label = "strong_positive"
+    elif score >= 60:
+        label = "positive"
+    elif score <= 25:
+        label = "strong_negative"
+    elif score <= 40:
+        label = "negative"
+    else:
+        label = "neutral"
+    return {
+        "score": round(score, 1),
+        "label": label,
+        "positive_terms": sorted(set(matched_pos))[:8],
+        "negative_terms": sorted(set(matched_neg))[:8],
+    }
+
+
+def summarize_news_rows(ticker: str, rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    rows = rows[:BENZINGA_MAX_ROWS]
+    scoring = score_rows_text(rows)
+    top = rows[0] if rows else {}
+    channels = [str(c.get("name") or c) for c in (top.get("channels") or []) if c]
+    title = top.get("title") if rows else None
+    created = top.get("created") or top.get("updated") if rows else None
+    recency = minutes_since_benzinga_time(created)
+
+    one_hour_count = 0
+    for row in rows:
+        mins = minutes_since_benzinga_time(row.get("created") or row.get("updated"))
+        if mins is not None and mins <= 60:
+            one_hour_count += 1
+
+    return {
+        "news_catalyst_score": scoring["score"],
+        "news_catalyst_label": scoring["label"],
+        "top_headline": title,
+        "top_headline_url": top.get("url") if rows else None,
+        "headline_count_1h": one_hour_count,
+        "headline_count_24h": len(rows),
+        "news_recency_minutes": recency,
+        "catalyst_type": classify_catalyst_type(str(title or ""), channels),
+        "channels": channels[:5],
+        "importance_rank": top.get("importance_rank") if rows else None,
+        "positive_terms": scoring["positive_terms"],
+        "negative_terms": scoring["negative_terms"],
+    }
+
+
+def summarize_wiim_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    rows = rows[:5]
+    if not rows:
+        return {"why_moving": None, "wiim_catalyst_type": None, "wiim_score": 0}
+    top = rows[0]
+    title = str(top.get("title") or top.get("teaser") or "")
+    scoring = score_rows_text(rows)
+    return {
+        "why_moving": title[:240] if title else None,
+        "wiim_catalyst_type": classify_catalyst_type(title, [str(c.get("name") or c) for c in (top.get("channels") or [])]),
+        "wiim_score": scoring["score"],
+    }
+
+
+def summarize_newsquantified_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    if not rows:
+        return {
+            "news_sentiment_score": 0,
+            "news_relevance_score": 0,
+            "news_impact_score": 0,
+            "news_trending_score": 0,
+        }
+
+    # NewsQuantified field names vary. Use robust numeric hints when present.
+    row = rows[0]
+    nums = []
+    for key in ["Sentiment", "sentiment", "NewsSentiment", "news_sentiment", "Comments"]:
+        val = safe_float(row.get(key), None) if row.get(key) is not None else None
+        if val is not None:
+            nums.append(val)
+    # Price reaction fields can imply impact/trending when non-zero.
+    reaction_vals = []
+    for key in ["30_Seconds%", "1_Minute%", "5_Minutes%", "10_Minutes%", "30_Minutes%", "60_Minutes%"]:
+        if row.get(key) is not None:
+            reaction_vals.append(abs(safe_float(row.get(key))))
+    impact = clamp(50 + min(sum(reaction_vals), 10) * 5) if reaction_vals else 50
+    trend = clamp(50 + min(safe_float(row.get("Curr_Vol")) / max(safe_float(row.get("Close_Vol")), 1), 5) * 8) if row.get("Curr_Vol") else 50
+    sentiment = clamp(50 + (sum(nums) / len(nums) if nums else 0))
+    relevance = 65 if rows else 0
+    return {
+        "news_sentiment_score": round(sentiment, 1),
+        "news_relevance_score": round(relevance, 1),
+        "news_impact_score": round(impact, 1),
+        "news_trending_score": round(trend, 1),
+    }
+
+
+def summarize_options_activity(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    if not rows:
+        return {
+            "options_flow_score": 0,
+            "flow_direction": "none",
+            "dominant_contracts": [],
+            "call_put_ratio": None,
+            "premium_bought": None,
+            "largest_trade_premium": None,
+            "flow_confirms_technical_signal": None,
+        }
+
+    call_count = 0
+    put_count = 0
+    premiums: List[float] = []
+    contracts: List[Dict[str, Any]] = []
+
+    for row in rows[:20]:
+        blob = json.dumps(row, default=str).lower()
+        if "call" in blob:
+            call_count += 1
+        if "put" in blob:
+            put_count += 1
+        premium = 0.0
+        for key in ["cost_basis", "premium", "trade_value", "value", "notional", "size"]:
+            premium = max(premium, safe_float(row.get(key)))
+        if premium > 0:
+            premiums.append(premium)
+        contracts.append({
+            "symbol": row.get("option_symbol") or row.get("symbol") or row.get("ticker"),
+            "type": row.get("put_call") or row.get("option_type") or row.get("type"),
+            "strike": row.get("strike_price") or row.get("strike"),
+            "expiration": row.get("date_expiration") or row.get("expiration"),
+            "premium": round(premium, 2) if premium else None,
+            "sentiment": row.get("sentiment"),
+        })
+
+    if call_count > put_count * 1.25:
+        direction = "bullish"
+    elif put_count > call_count * 1.25:
+        direction = "bearish"
+    elif call_count or put_count:
+        direction = "mixed"
+    else:
+        direction = "none"
+
+    total = call_count + put_count
+    call_put_ratio = round(call_count / max(put_count, 1), 2) if total else None
+    base = 45 + min(total, 20) * 2
+    if direction == "bullish":
+        score = base + 15
+    elif direction == "bearish":
+        score = base - 25
+    elif direction == "mixed":
+        score = base
+    else:
+        score = 0
+
+    return {
+        "options_flow_score": round(clamp(score), 1),
+        "flow_direction": direction,
+        "dominant_contracts": contracts[:3],
+        "call_put_ratio": call_put_ratio,
+        "premium_bought": round(sum(premiums), 2) if premiums else None,
+        "largest_trade_premium": round(max(premiums), 2) if premiums else None,
+        "flow_confirms_technical_signal": True if direction == "bullish" else (False if direction == "bearish" else None),
+    }
+
+
+def summarize_calendar_rows(rows: List[Dict[str, Any]], kind: str) -> Dict[str, Any]:
+    has = bool(rows)
+    top = rows[0] if rows else {}
+    blob = json.dumps(top, default=str).lower()
+
+    if kind == "ratings":
+        scoring = score_rows_text(rows)
+        return {
+            "analyst_catalyst_score": scoring["score"] if has else 0,
+            "latest_rating_action": top.get("action") or top.get("rating_action") or top.get("importance") or top.get("action_pt"),
+            "rating_current": top.get("rating_current") or top.get("current_rating"),
+            "rating_prior": top.get("rating_prior") or top.get("previous_rating"),
+            "price_target_current": top.get("pt_current") or top.get("price_target") or top.get("price_target_current"),
+            "price_target_prior": top.get("pt_prior") or top.get("price_target_prior"),
+            "price_target_change_pct": None,
+        }
+
+    if kind == "earnings":
+        return {
+            "earnings_date": top.get("date") or top.get("report_date") if has else None,
+            "earnings_time": top.get("time") or top.get("period") if has else "unknown",
+            "days_to_earnings": None,
+            "eps_estimate": top.get("eps_est") or top.get("eps_estimate"),
+            "eps_actual": top.get("eps") or top.get("eps_actual"),
+            "eps_surprise_pct": top.get("eps_surprise_percent") or top.get("eps_surprise_pct"),
+            "revenue_estimate": top.get("revenue_est") or top.get("revenue_estimate"),
+            "revenue_actual": top.get("revenue") or top.get("revenue_actual"),
+            "revenue_surprise_pct": top.get("revenue_surprise_percent") or top.get("revenue_surprise_pct"),
+            "earnings_risk_flag": has,
+        }
+
+    if kind == "guidance":
+        direction = "none"
+        if "raise" in blob or "above" in blob:
+            direction = "raised"
+        elif "lower" in blob or "below" in blob or "cut" in blob:
+            direction = "lowered"
+        elif has:
+            direction = "reaffirmed"
+        return {
+            "guidance_direction": direction,
+            "guidance_surprise_score": 70 if direction == "raised" else (30 if direction == "lowered" else (50 if has else 0)),
+        }
+
+    if kind == "offerings":
+        return {
+            "offering_flag": has,
+            "offering_price": top.get("price") or top.get("offering_price"),
+            "offering_proceeds": top.get("proceeds") or top.get("amount"),
+            "dilution_risk_score": 80 if has else 0,
+        }
+
+    if kind == "fda":
+        return {
+            "fda_event_risk": has,
+            "fda_event_date": top.get("date") if has else None,
+            "fda_event_type": top.get("type") or top.get("event_type"),
+            "fda_catalyst_score": 65 if has else 0,
+        }
+
+    if kind == "mna":
+        return {
+            "mna_flag": has,
+            "deal_status": top.get("deal_status") or top.get("status"),
+            "deal_price": top.get("deal_price") or top.get("price"),
+            "deal_value": top.get("deal_value") or top.get("value"),
+        }
+
+    if kind == "halts":
+        return {
+            "halt_flag": has,
+            "halt_reason": top.get("reason") or top.get("halt_reason"),
+            "resume_time": top.get("resume_time") or top.get("resumption_time"),
+            "halt_risk_score": 90 if has else 0,
+        }
+
+    return {f"{kind}_flag": has}
+
+
+def summarize_short_interest(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    if not rows:
+        return {"short_interest_pct_float": None, "days_to_cover": None, "short_interest_change_pct": None, "short_squeeze_score": 0}
+    row = rows[0]
+    pct = safe_float(row.get("shortPercentOfFloat") or row.get("short_interest_pct_float") or row.get("shortFloat"))
+    days = safe_float(row.get("daysToCover") or row.get("days_to_cover"))
+    change = safe_float(row.get("changePercent") or row.get("short_interest_change_pct"))
+    score = 0.0
+    if pct >= 20:
+        score += 45
+    elif pct >= 10:
+        score += 30
+    elif pct > 0:
+        score += 15
+    if days >= 5:
+        score += 25
+    elif days >= 2:
+        score += 12
+    if change > 10:
+        score += 15
+    return {"short_interest_pct_float": pct or None, "days_to_cover": days or None, "short_interest_change_pct": change or None, "short_squeeze_score": round(clamp(score), 1)}
+
+
+def summarize_insider_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    if not rows:
+        return {"insider_activity_score": 0, "recent_insider_buying": False, "recent_insider_selling": False}
+    blob = json.dumps(rows[:10], default=str).lower()
+    buying = any(x in blob for x in ["buy", "purchase", "acquisition"])
+    selling = any(x in blob for x in ["sell", "sale", "disposition"])
+    score = 65 if buying and not selling else (35 if selling and not buying else 50)
+    return {"insider_activity_score": score, "recent_insider_buying": buying, "recent_insider_selling": selling}
+
+
+def summarize_block_trades(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    if not rows:
+        return {"block_trade_score": 0, "block_trade_direction": "unclear", "largest_block_notional": None, "block_trade_count": 0}
+    notionals = []
+    for row in rows[:20]:
+        notional = 0.0
+        for key in ["notional", "trade_value", "value", "amount"]:
+            notional = max(notional, safe_float(row.get(key)))
+        notionals.append(notional)
+    return {
+        "block_trade_score": round(clamp(45 + min(len(rows), 20) * 2), 1),
+        "block_trade_direction": "unclear",
+        "largest_block_notional": round(max(notionals), 2) if notionals else None,
+        "block_trade_count": len(rows),
+    }
+
+
+async def fetch_benzinga_catalyst_summary(
+    client: httpx.AsyncClient,
+    ticker: str,
+    include_options_flow: bool = True,
+    include_risk_events: bool = True,
+) -> Dict[str, Any]:
+    ticker = normalize_ticker(ticker)
+    if not ticker or is_crypto_ticker(ticker):
+        return {"enabled": bool(BENZINGA_API_KEY), "ticker": ticker, "final_benzinga_score": 0, "risk_flags": ["Benzinga equity catalyst not available for this symbol."]}
+
+    async def get_rows(path: str, params: Dict[str, Any]) -> List[Dict[str, Any]]:
+        result = await benzinga_raw_get(client, path, params)
+        if not result.get("ok"):
+            return []
+        return benzinga_extract_rows(result.get("data"))
+
+    # Core catalyst endpoints. Keep limits compact to avoid slow scans.
+    news_rows = await get_rows("/api/v2/news", {"tickers": ticker, "pageSize": 10, "displayOutput": "abstract"})
+    wiim_rows = await get_rows("/api/v2/news", {"tickers": ticker, "pageSize": 5, "displayOutput": "abstract", "channels": "WIIM"})
+    nq_rows = await get_rows("/api/v2/newsquantified", {"tickers": ticker, "limit": 10})
+    ratings_rows = await get_rows("/api/v2.1/calendar/ratings", {"tickers": ticker, "limit": 10})
+    earnings_rows = await get_rows("/api/v2.1/calendar/earnings", {"tickers": ticker, "limit": 5}) if include_risk_events else []
+    guidance_rows = await get_rows("/api/v2.1/calendar/guidance", {"tickers": ticker, "limit": 5}) if include_risk_events else []
+    offerings_rows = await get_rows("/api/v2.1/calendar/offerings", {"tickers": ticker, "limit": 5}) if include_risk_events else []
+    fda_rows = await get_rows("/api/v2.1/calendar/fda", {"tickers": ticker, "limit": 5}) if include_risk_events else []
+    mna_rows = await get_rows("/api/v2.1/calendar/ma", {"tickers": ticker, "limit": 5}) if include_risk_events else []
+    halt_rows = await get_rows("/api/v1/signal/halt_resume", {"tickers": ticker, "limit": 5}) if include_risk_events else []
+    short_rows = await get_rows("/api/v1/shortinterest", {"symbols": ticker, "limit": 5}) if include_risk_events else []
+    insider_rows = await get_rows("/api/v1/sec/insider_transactions/transactions", {"tickers": ticker, "limit": 10}) if include_risk_events else []
+    block_rows = await get_rows("/api/v1/signal/block_trade", {"tickers": ticker, "limit": 10})
+    option_rows = await get_rows("/api/v1/signal/option_activity", {"tickers": ticker, "limit": 20}) if include_options_flow else []
+
+    news = summarize_news_rows(ticker, news_rows)
+    wiim = summarize_wiim_rows(wiim_rows)
+    nq = summarize_newsquantified_rows(nq_rows)
+    options = summarize_options_activity(option_rows)
+    analyst = summarize_calendar_rows(ratings_rows, "ratings")
+    earnings = summarize_calendar_rows(earnings_rows, "earnings")
+    guidance = summarize_calendar_rows(guidance_rows, "guidance")
+    offerings = summarize_calendar_rows(offerings_rows, "offerings")
+    fda = summarize_calendar_rows(fda_rows, "fda")
+    mna = summarize_calendar_rows(mna_rows, "mna")
+    halts = summarize_calendar_rows(halt_rows, "halts")
+    short_interest = summarize_short_interest(short_rows)
+    insider = summarize_insider_rows(insider_rows)
+    blocks = summarize_block_trades(block_rows)
+
+    support_factors: List[str] = []
+    risk_flags: List[str] = []
+
+    if news.get("news_catalyst_score", 0) >= 60:
+        support_factors.append("Positive Benzinga news catalyst")
+    if wiim.get("wiim_score", 0) >= 60:
+        support_factors.append("Benzinga WIIM supports move")
+    if options.get("flow_direction") == "bullish":
+        support_factors.append("Bullish unusual options flow")
+    if analyst.get("analyst_catalyst_score", 0) >= 60:
+        support_factors.append("Positive analyst catalyst")
+    if guidance.get("guidance_direction") == "raised":
+        support_factors.append("Raised guidance")
+    if short_interest.get("short_squeeze_score", 0) >= 50:
+        support_factors.append("Short-squeeze potential")
+    if blocks.get("block_trade_score", 0) >= 55:
+        support_factors.append("Block trade activity detected")
+    if insider.get("recent_insider_buying"):
+        support_factors.append("Recent insider buying detected")
+
+    if news.get("news_catalyst_label") in {"negative", "strong_negative"}:
+        risk_flags.append("Negative Benzinga news catalyst")
+    if options.get("flow_direction") == "bearish":
+        risk_flags.append("Bearish unusual options flow")
+    if offerings.get("offering_flag"):
+        risk_flags.append("Offering/dilution risk")
+    if halts.get("halt_flag"):
+        risk_flags.append("Halt/resume risk")
+    if earnings.get("earnings_risk_flag"):
+        risk_flags.append("Earnings event risk")
+    if fda.get("fda_event_risk"):
+        risk_flags.append("FDA/binary biotech event risk")
+    if mna.get("mna_flag"):
+        risk_flags.append("M&A/deal event may distort technicals")
+    if guidance.get("guidance_direction") == "lowered":
+        risk_flags.append("Lowered guidance")
+    if insider.get("recent_insider_selling") and not insider.get("recent_insider_buying"):
+        risk_flags.append("Recent insider selling detected")
+
+    positive_score = (
+        safe_float(news.get("news_catalyst_score")) * 0.22
+        + safe_float(wiim.get("wiim_score")) * 0.12
+        + safe_float(nq.get("news_impact_score")) * 0.08
+        + safe_float(options.get("options_flow_score")) * 0.20
+        + safe_float(analyst.get("analyst_catalyst_score")) * 0.14
+        + safe_float(guidance.get("guidance_surprise_score")) * 0.07
+        + safe_float(short_interest.get("short_squeeze_score")) * 0.05
+        + safe_float(blocks.get("block_trade_score")) * 0.05
+        + safe_float(insider.get("insider_activity_score")) * 0.07
+    )
+
+    risk_penalty = 0.0
+    if offerings.get("offering_flag"):
+        risk_penalty += 22
+    if halts.get("halt_flag"):
+        risk_penalty += 30
+    if options.get("flow_direction") == "bearish":
+        risk_penalty += 18
+    if news.get("news_catalyst_label") in {"negative", "strong_negative"}:
+        risk_penalty += 15
+    if guidance.get("guidance_direction") == "lowered":
+        risk_penalty += 18
+    if earnings.get("earnings_risk_flag"):
+        risk_penalty += 8
+    if fda.get("fda_event_risk"):
+        risk_penalty += 10
+
+    final_score = clamp(positive_score - risk_penalty)
+    if final_score >= 75:
+        final_label = "strong_positive_catalyst"
+    elif final_score >= 60:
+        final_label = "positive_catalyst"
+    elif final_score <= 25:
+        final_label = "high_risk_or_negative"
+    elif final_score <= 40:
+        final_label = "negative_or_weak_catalyst"
+    else:
+        final_label = "neutral_or_mixed"
+
+    return {
+        "enabled": bool(BENZINGA_API_KEY),
+        "ticker": ticker,
+        **news,
+        **wiim,
+        **nq,
+        **options,
+        **analyst,
+        **earnings,
+        **guidance,
+        **offerings,
+        **fda,
+        **mna,
+        **halts,
+        **short_interest,
+        **insider,
+        **blocks,
+        "final_benzinga_score": round(final_score, 1),
+        "final_benzinga_label": final_label,
+        "support_factors": support_factors[:8],
+        "risk_flags": risk_flags[:10],
+        "available_sources": {
+            "news": bool(news_rows),
+            "wiim": bool(wiim_rows),
+            "newsquantified": bool(nq_rows),
+            "unusual_options": bool(option_rows),
+            "analyst_ratings": bool(ratings_rows),
+            "earnings": bool(earnings_rows),
+            "guidance": bool(guidance_rows),
+            "offerings": bool(offerings_rows),
+            "fda": bool(fda_rows),
+            "mna": bool(mna_rows),
+            "halts": bool(halt_rows),
+            "short_interest": bool(short_rows),
+            "insider_transactions": bool(insider_rows),
+            "block_trades": bool(block_rows),
+        },
+    }
+
+
+@app.get("/benzinga_catalyst")
+async def benzinga_catalyst(ticker: str = "NVDA") -> Dict[str, Any]:
+    timeout = BENZINGA_TIMEOUT
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        return await fetch_benzinga_catalyst_summary(client, ticker)
+
+
+class PremarketRecommendationRequest(BaseModel):
+    universe: Literal["sp500", "dow30", "nasdaq100", "russell2000", "crypto", "watchlist", "all"] = "watchlist"
+    horizon: Literal["1d", "1w", "1mo"] = "1d"
+    tickers: Optional[List[str]] = Field(default=None, description="Optional explicit ticker list")
+    refresh: bool = Field(default=False)
+    limit: int = Field(default=10, ge=1, le=25)
+    min_price: float = Field(default=0.0, ge=0.0)
+    min_volume: float = Field(default=0.0, ge=0.0)
+    min_premarket_volume: float = Field(default=0.0, ge=0.0)
+    include_benzinga: bool = Field(default=True)
+    include_options_flow: bool = Field(default=True)
+    include_risk_events: bool = Field(default=True)
+    strategy: Literal["momentum", "rebound", "rebound_and_momentum", "conservative"] = "rebound_and_momentum"
+
+
+def classify_premarket_recommendation(row: Dict[str, Any]) -> str:
+    gap = safe_float(row.get("gap_pct"))
+    dist = safe_float(row.get("distance_from_premarket_high_pct"))
+    pre_setup = str(row.get("premarket_setup") or "")
+    benz = row.get("benzinga") or {}
+    benz_score = safe_float(benz.get("final_benzinga_score"))
+    options_dir = str(benz.get("flow_direction") or "none")
+    risk_flags = benz.get("risk_flags") or []
+
+    if any("Offering" in x or "Halt" in x or "Lowered guidance" in x for x in risk_flags):
+        return "avoid_event_risk"
+    if pre_setup in {"gap_and_fade", "premarket_exhaustion"} or dist < -2.0:
+        return "avoid_fake_gap_or_fade"
+    if options_dir == "bearish":
+        return "avoid_bearish_options_flow"
+    if pre_setup == "extended_gap_and_hold":
+        return "wait_for_pullback_or_opening_range_break"
+    if pre_setup == "gap_and_hold" and benz_score >= 60 and dist >= -1.0:
+        if options_dir == "bullish":
+            return "options_flow_confirmed_gap_and_hold"
+        return "news_driven_gap_and_hold"
+    if pre_setup in {"gap_and_hold", "red_to_green_attempt"} and dist >= -1.0:
+        return "opening_range_break_candidate"
+    if gap < 0 and benz_score >= 55:
+        return "rebound_watch"
+    if benz_score >= 65:
+        return "news_driven_momentum_watch"
+    return "watch_only"
+
+
+def compact_premarket_recommendation(sig: Dict[str, Any]) -> Dict[str, Any]:
+    pre = sig.get("premarket", {}) or {}
+    trade = sig.get("trade_plan", {}) or {}
+    benz = sig.get("benzinga", {}) or {}
+
+    technical_score = safe_float(sig.get("overall_score"))
+    premarket_score = safe_float(sig.get("premarket_quality_score"))
+    benz_score = safe_float(benz.get("final_benzinga_score"))
+
+    # Penalty for major risk flags.
+    risk_flags = list(benz.get("risk_flags") or [])
+    penalty = 0.0
+    if any("Offering" in f for f in risk_flags):
+        penalty += 25
+    if any("Halt" in f for f in risk_flags):
+        penalty += 30
+    if any("Bearish" in f for f in risk_flags):
+        penalty += 15
+    if safe_float(pre.get("distance_from_premarket_high_pct")) < -2:
+        penalty += 12
+
+    final_score = clamp(
+        premarket_score * 0.38
+        + technical_score * 0.27
+        + benz_score * 0.35
+        - penalty
+    )
+
+    row = {
+        "ticker": sig.get("ticker"),
+        "premarket_price": pre.get("premarket_price"),
+        "gap_pct": pre.get("gap_pct"),
+        "premarket_volume": pre.get("premarket_volume"),
+        "premarket_high": pre.get("premarket_high"),
+        "premarket_low": pre.get("premarket_low"),
+        "distance_from_premarket_high_pct": pre.get("distance_from_premarket_high_pct"),
+        "premarket_setup": pre.get("premarket_setup"),
+        "opening_strategy": pre.get("opening_strategy"),
+        "entry": trade.get("entry"),
+        "entry_basis": trade.get("entry_basis"),
+        "stop": trade.get("stop"),
+        "target_1": trade.get("target_1"),
+        "target_2": trade.get("target_2"),
+        "risk_reward": trade.get("reward_risk_to_target_2"),
+        "invalidates_below": trade.get("invalidates_below"),
+        "technical_score": round(technical_score, 1),
+        "premarket_quality_score": round(premarket_score, 1),
+        "benzinga_score": benz.get("final_benzinga_score", 0),
+        "benzinga_label": benz.get("final_benzinga_label"),
+        "news_catalyst_score": benz.get("news_catalyst_score", 0),
+        "news_catalyst_label": benz.get("news_catalyst_label"),
+        "options_flow_score": benz.get("options_flow_score", 0),
+        "flow_direction": benz.get("flow_direction"),
+        "call_put_ratio": benz.get("call_put_ratio"),
+        "analyst_catalyst_score": benz.get("analyst_catalyst_score", 0),
+        "earnings_risk_flag": benz.get("earnings_risk_flag", False),
+        "guidance_direction": benz.get("guidance_direction"),
+        "offering_flag": benz.get("offering_flag", False),
+        "halt_flag": benz.get("halt_flag", False),
+        "fda_event_risk": benz.get("fda_event_risk", False),
+        "mna_flag": benz.get("mna_flag", False),
+        "short_squeeze_score": benz.get("short_squeeze_score", 0),
+        "insider_activity_score": benz.get("insider_activity_score", 0),
+        "why_moving": benz.get("why_moving"),
+        "top_headline": benz.get("top_headline"),
+        "headline_count_1h": benz.get("headline_count_1h", 0),
+        "news_recency_minutes": benz.get("news_recency_minutes"),
+        "support_factors": benz.get("support_factors") or [],
+        "risk_flags": risk_flags,
+        "final_recommendation_score": round(final_score, 1),
+        "risk_profile": sig.get("risk_profile"),
+        "setup": sig.get("setup"),
+    }
+    row["action"] = classify_premarket_recommendation({**row, "benzinga": benz})
+    return row
+
+
+async def build_premarket_recommendation_rows(req: PremarketRecommendationRequest, universe: str) -> Dict[str, Any]:
+    pre_req = PremarketRequest(
+        universe=universe,
+        horizon=req.horizon,
+        tickers=req.tickers,
+        refresh=False,
+        limit=req.limit,
+        min_price=req.min_price,
+        min_volume=req.min_volume,
+        min_premarket_volume=req.min_premarket_volume,
+    )
+    pre_req.include_news_catalysts = False
+    block = await build_premarket_rows(pre_req, universe)
+    signals = block.get("signals", []) or []
+
+    if req.include_benzinga and signals:
+        timeout = BENZINGA_TIMEOUT
+        semaphore = asyncio.Semaphore(4)
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            async def one(sig: Dict[str, Any]) -> Dict[str, Any]:
+                ticker = str(sig.get("ticker") or "").upper()
+                async with semaphore:
+                    sig["benzinga"] = await fetch_benzinga_catalyst_summary(
+                        client,
+                        ticker,
+                        include_options_flow=req.include_options_flow,
+                        include_risk_events=req.include_risk_events,
+                    )
+                    await asyncio.sleep(0.05)
+                    return sig
+            updated = await asyncio.gather(*(one(s) for s in signals), return_exceptions=True)
+            signals = [x for x in updated if isinstance(x, dict)]
+
+    compact = [compact_premarket_recommendation(sig) for sig in signals]
+    compact.sort(
+        key=lambda x: (
+            safe_float(x.get("final_recommendation_score")),
+            safe_float(x.get("premarket_quality_score")),
+            safe_float(x.get("benzinga_score")),
+        ),
+        reverse=True,
+    )
+
+    return {
+        "universe": universe,
+        "candidate_count": len(compact),
+        "returned": min(req.limit, len(compact)),
+        "signals": compact[:req.limit],
+        "skipped": (block.get("skipped") or [])[:25],
+    }
+
+
+@app.post("/premarket_recommendations")
+async def premarket_recommendations(req: PremarketRecommendationRequest) -> Dict[str, Any]:
+    if not INDEX_MAP and not req.tickers:
+        raise HTTPException(status_code=500, detail="No constituents loaded. Put constituents.json next to main.py or pass explicit tickers.")
+
+    if req.refresh or not cache_is_fresh():
+        await refresh_cache()
+
+    universes = ALL_UNIVERSES if req.universe == "all" else [req.universe]
+    cache = cache_status()
+    universe_blocks = [await build_premarket_recommendation_rows(req, universe) for universe in universes]
+
+    all_rows: List[Dict[str, Any]] = []
+    for block in universe_blocks:
+        all_rows.extend(block.get("signals", []) or [])
+
+    all_rows.sort(key=lambda x: safe_float(x.get("final_recommendation_score")), reverse=True)
+
+    return {
+        "horizon": req.horizon,
+        "strategy": req.strategy,
+        "polygon_enabled": bool(POLYGON_API_KEY),
+        "benzinga_enabled": bool(BENZINGA_API_KEY),
+        "cache": {
+            "cached": cache.get("cached"),
+            "fresh": cache.get("fresh"),
+            "generated_at": cache.get("generated_at"),
+            "market_date": cache.get("market_date"),
+            "errors": (cache.get("errors") or [])[:5],
+        },
+        "methodology": {
+            "version": "premarket_recommendations_benzinga_v2",
+            "purpose": "Compact premarket recommendations using Polygon technicals plus Benzinga catalysts, options flow, analyst actions, and risk events.",
+            "benzinga_sources": [
+                "news", "wiim", "newsquantified", "unusual_options", "market_movers",
+                "analyst_ratings", "earnings", "guidance", "offerings", "fda",
+                "mna", "halts", "short_interest", "insider_transactions", "block_trades",
+            ],
+            "excluded_sources": ["government_trades"],
+        },
+        "universes": universe_blocks,
+        "summary": {
+            "top_recommendations": [
+                {
+                    "ticker": r.get("ticker"),
+                    "action": r.get("action"),
+                    "score": r.get("final_recommendation_score"),
+                    "gap_pct": r.get("gap_pct"),
+                    "benzinga_score": r.get("benzinga_score"),
+                    "flow_direction": r.get("flow_direction"),
+                    "top_headline": r.get("top_headline"),
+                }
+                for r in all_rows[:10]
+            ],
+            "avoid": [
+                {"ticker": r.get("ticker"), "action": r.get("action"), "risk_flags": r.get("risk_flags")}
+                for r in all_rows if str(r.get("action") or "").startswith("avoid")
+            ][:10],
+            "options_flow_confirmed": [
+                r.get("ticker") for r in all_rows if r.get("action") == "options_flow_confirmed_gap_and_hold"
+            ][:10],
+        },
+    }
+
+
 
 
 
