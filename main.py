@@ -111,13 +111,59 @@ def cache_is_fresh() -> bool:
     return age is not None and age <= CACHE_MAX_AGE_SECONDS and bool(CACHE.get("stock_rows"))
 
 
+# NYSE/Nasdaq full-market holidays used to avoid false Polygon stale warnings.
+# Keep this list explicit so the backend works without adding a calendar dependency.
+# Add future years here as needed.
+US_MARKET_HOLIDAYS = {
+    # 2026
+    "2026-01-01",  # New Year's Day
+    "2026-01-19",  # Martin Luther King Jr. Day
+    "2026-02-16",  # Presidents' Day
+    "2026-04-03",  # Good Friday
+    "2026-05-25",  # Memorial Day
+    "2026-06-19",  # Juneteenth
+    "2026-07-03",  # Independence Day observed
+    "2026-09-07",  # Labor Day
+    "2026-11-26",  # Thanksgiving Day
+    "2026-12-25",  # Christmas Day
+    # 2027
+    "2027-01-01",
+    "2027-01-18",
+    "2027-02-15",
+    "2027-03-26",
+    "2027-05-31",
+    "2027-06-18",
+    "2027-07-05",
+    "2027-09-06",
+    "2027-11-25",
+    "2027-12-24",
+}
+
+
+def is_us_market_trading_day(day) -> bool:
+    if isinstance(day, datetime):
+        d = day.date()
+    else:
+        d = day
+    return d.weekday() < 5 and d.isoformat() not in US_MARKET_HOLIDAYS
+
+
+def previous_us_market_trading_day(day=None) -> str:
+    d = (day.date() if isinstance(day, datetime) else day) if day is not None else datetime.now(timezone.utc).date()
+    d = d - timedelta(days=1)
+    while not is_us_market_trading_day(d):
+        d = d - timedelta(days=1)
+    return d.isoformat()
+
+
 def recent_market_dates(days_back: int = 10) -> List[str]:
-    # Try recent weekdays. Polygon will simply return no rows for market holidays.
+    # Try recent real U.S. market trading days. This skips weekends and known full-market holidays
+    # such as Juneteenth, preventing false stale warnings and noisy Polygon errors.
     dates: List[str] = []
     d = datetime.now(timezone.utc).date()
     for i in range(1, days_back + 1):
         candidate = d - timedelta(days=i)
-        if candidate.weekday() < 5:
+        if is_us_market_trading_day(candidate):
             dates.append(candidate.isoformat())
     return dates
 
@@ -212,11 +258,13 @@ async def fetch_grouped_stocks_for_date(client: httpx.AsyncClient, market_date: 
 
 
 def recent_weekday_dates(days_back: int = 60) -> List[str]:
+    # Historical windows should also skip known market holidays so the cache does not
+    # report expected closures as data errors.
     dates: List[str] = []
     d = datetime.now(timezone.utc).date()
     for i in range(1, days_back + 1):
         candidate = d - timedelta(days=i)
-        if candidate.weekday() < 5:
+        if is_us_market_trading_day(candidate):
             dates.append(candidate.isoformat())
     return dates
 
@@ -3223,6 +3271,7 @@ async def premarket_brief(req: PremarketBriefRequest) -> Dict[str, Any]:
             "stale_data_warning": stale.get("stale_data_warning"),
             "stale_data_reason": stale.get("stale_data_reason"),
             "market_date_age_calendar_days": stale.get("market_date_age_calendar_days"),
+            "expected_market_date": stale.get("expected_market_date"),
             "errors": (cache.get("errors") or [])[:5],
         },
         "methodology": {
@@ -3261,29 +3310,60 @@ def compute_stale_data_warning(cache: Dict[str, Any]) -> Dict[str, Any]:
     market_date = cache.get("market_date")
     generated_at = cache.get("generated_at")
     age_days = None
+    expected_market_date = None
     warning = False
     reason = None
     try:
         md = datetime.strptime(str(market_date)[:10], "%Y-%m-%d").date() if market_date else None
         if generated_at:
-            gd = datetime.fromisoformat(str(generated_at).replace("Z", "+00:00")).date()
+            gd_dt = datetime.fromisoformat(str(generated_at).replace("Z", "+00:00"))
+            gd = gd_dt.date()
         else:
-            gd = datetime.now(timezone.utc).date()
+            gd_dt = datetime.now(timezone.utc)
+            gd = gd_dt.date()
+
+        # For premarket recommendations, grouped daily data is intentionally prior-session
+        # data because it is the reference close used for gap calculations. On Monday
+        # 2026-06-22, the correct prior trading day is 2026-06-18 because 2026-06-19
+        # was Juneteenth and the weekend followed.
+        expected_market_date = previous_us_market_trading_day(gd)
+
         if md:
             age_days = (gd - md).days
-            if age_days > 3:
+            if market_date != expected_market_date:
                 warning = True
-                reason = f"Polygon grouped market_date is {age_days} calendar days behind generated_at. Verify live/pre-market prices before trading."
+                reason = (
+                    f"Polygon grouped market_date {market_date} does not match expected prior "
+                    f"U.S. trading day {expected_market_date}. Verify live/pre-market prices before trading."
+                )
+        else:
+            warning = True
+            reason = "Polygon grouped market_date is missing. Verify market data before trading."
     except Exception:
-        pass
-    errors = cache.get("errors") or []
-    if any("No grouped stock rows returned" in str(e) for e in errors) and age_days is not None and age_days > 1:
         warning = True
-        reason = reason or "Polygon grouped rows were unavailable for at least one recent date. Verify freshness before trading."
+        reason = "Could not validate Polygon market_date freshness."
+
+    errors = cache.get("errors") or []
+    unexpected_grouped_errors = []
+    for e in errors:
+        msg = str(e)
+        if "No grouped stock rows returned for" in msg:
+            date_text = msg.rsplit(" ", 1)[-1]
+            try:
+                d = datetime.strptime(date_text[:10], "%Y-%m-%d").date()
+                if is_us_market_trading_day(d):
+                    unexpected_grouped_errors.append(msg)
+            except Exception:
+                unexpected_grouped_errors.append(msg)
+    if unexpected_grouped_errors and not warning:
+        warning = True
+        reason = "Polygon grouped rows were unavailable for an expected U.S. trading day. Verify freshness before trading."
+
     return {
         "stale_data_warning": warning,
         "stale_data_reason": reason,
         "market_date_age_calendar_days": age_days,
+        "expected_market_date": expected_market_date,
     }
 
 
@@ -4419,10 +4499,11 @@ async def premarket_recommendations(req: PremarketRecommendationRequest) -> Dict
             "stale_data_warning": stale.get("stale_data_warning"),
             "stale_data_reason": stale.get("stale_data_reason"),
             "market_date_age_calendar_days": stale.get("market_date_age_calendar_days"),
+            "expected_market_date": stale.get("expected_market_date"),
             "errors": (cache.get("errors") or [])[:5],
         },
         "methodology": {
-            "version": "premarket_recommendations_benzinga_v2_6",
+            "version": "premarket_recommendations_benzinga_v2_7",
             "purpose": "Compact premarket recommendations using Polygon technicals plus Benzinga catalysts, options flow, analyst actions, and risk events.",
             "benzinga_sources": [
                 "news", "wiim", "newsquantified", "unusual_options", "market_movers",
