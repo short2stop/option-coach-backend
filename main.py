@@ -19,7 +19,9 @@ from pydantic import BaseModel, Field
 app = FastAPI(title="Option Coach Backend - Signals v2")
 
 POLYGON_API_KEY = os.getenv("POLYGON_API_KEY", "").strip()
+BENZINGA_API_KEY = os.getenv("BENZINGA_API_KEY", "").strip()
 POLYGON_BASE = "https://api.polygon.io/v2"
+BENZINGA_BASE = "https://api.benzinga.com"
 CONSTITUENTS_FILE = Path(__file__).with_name("constituents.json")
 
 ALL_UNIVERSES = ["sp500", "dow30", "nasdaq100", "russell2000", "crypto", "watchlist"]
@@ -674,6 +676,420 @@ def build_universe_response(req: ScreenRequest, universe: str) -> Dict[str, Any]
     }
 
 
+# -------------------------
+# Benzinga capability test layer
+# -------------------------
+
+BENZINGA_TIMEOUT = httpx.Timeout(connect=8.0, read=15.0, write=8.0, pool=15.0)
+
+
+def compact_benzinga_payload_summary(data: Any) -> Dict[str, Any]:
+    """Return a compact summary of a Benzinga response without exposing raw data."""
+    if isinstance(data, list):
+        first = data[0] if data else {}
+        return {
+            "data_type": "list",
+            "record_count": len(data),
+            "sample_keys": sorted(list(first.keys()))[:20] if isinstance(first, dict) else [],
+        }
+    if isinstance(data, dict):
+        # Some Benzinga endpoints wrap rows in common keys.
+        possible_rows = None
+        for key in ["data", "results", "items", "ratings", "earnings", "option_activity"]:
+            if isinstance(data.get(key), list):
+                possible_rows = data.get(key)
+                break
+        return {
+            "data_type": "dict",
+            "record_count": len(possible_rows) if isinstance(possible_rows, list) else (1 if data else 0),
+            "sample_keys": sorted(list(data.keys()))[:20],
+        }
+    if isinstance(data, str):
+        return {
+            "data_type": "text",
+            "record_count": 0 if data.strip() in {"", "<result/>"} else 1,
+            "sample_keys": [],
+        }
+    return {"data_type": type(data).__name__, "record_count": 0, "sample_keys": []}
+
+
+async def benzinga_get(
+    client: httpx.AsyncClient,
+    path: str,
+    params: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Small safe Benzinga GET wrapper.
+
+    This deliberately returns only compact metadata. It never returns the API key
+    and should not return full raw Benzinga payloads.
+    """
+    if not BENZINGA_API_KEY:
+        return {
+            "ok": False,
+            "enabled": False,
+            "status_code": None,
+            "status": "missing_api_key",
+            "error": "BENZINGA_API_KEY is not loaded",
+            "summary": {"data_type": None, "record_count": 0, "sample_keys": []},
+        }
+
+    query = dict(params or {})
+    query["token"] = BENZINGA_API_KEY
+    url = f"{BENZINGA_BASE}{path}"
+
+    try:
+        resp = await client.get(url, params=query, headers={"accept": "application/json"})
+    except Exception as e:
+        return {
+            "ok": False,
+            "enabled": False,
+            "status_code": None,
+            "status": "request_failed",
+            "error": str(e),
+            "summary": {"data_type": None, "record_count": 0, "sample_keys": []},
+        }
+
+    status_code = resp.status_code
+    text_preview = resp.text[:250] if resp.text else ""
+
+    if status_code in {401, 403}:
+        return {
+            "ok": False,
+            "enabled": False,
+            "status_code": status_code,
+            "status": "unauthorized_or_not_entitled",
+            "error": text_preview,
+            "summary": {"data_type": None, "record_count": 0, "sample_keys": []},
+        }
+
+    if status_code == 404:
+        return {
+            "ok": False,
+            "enabled": False,
+            "status_code": status_code,
+            "status": "not_found_or_not_available",
+            "error": text_preview,
+            "summary": {"data_type": None, "record_count": 0, "sample_keys": []},
+        }
+
+    if status_code == 429:
+        return {
+            "ok": False,
+            "enabled": True,
+            "status_code": status_code,
+            "status": "rate_limited",
+            "error": text_preview,
+            "summary": {"data_type": None, "record_count": 0, "sample_keys": []},
+        }
+
+    if status_code < 200 or status_code >= 300:
+        return {
+            "ok": False,
+            "enabled": False,
+            "status_code": status_code,
+            "status": "http_error",
+            "error": text_preview,
+            "summary": {"data_type": None, "record_count": 0, "sample_keys": []},
+        }
+
+    try:
+        data = resp.json()
+    except Exception:
+        data = resp.text.strip()
+
+    summary = compact_benzinga_payload_summary(data)
+    record_count = safe_float(summary.get("record_count"))
+
+    if record_count > 0:
+        status = "enabled_with_data"
+    else:
+        # 200 with no rows usually means the product is reachable, but that
+        # this ticker/date/window did not return rows.
+        status = "reachable_no_data"
+
+    return {
+        "ok": True,
+        "enabled": True,
+        "status_code": status_code,
+        "status": status,
+        "error": None,
+        "summary": summary,
+    }
+
+
+BENZINGA_CAPABILITY_TESTS: Dict[str, Dict[str, Any]] = {
+    # High priority for the trading engine.
+    "news": {
+        "path": "/api/v2/news",
+        "params": {"pageSize": 3, "displayOutput": "abstract"},
+        "ticker_param": "tickers",
+    },
+    "wiim": {
+        # Benzinga documents WIIMs inside the News API family. Channel names may vary by subscription.
+        "path": "/api/v2/news",
+        "params": {"pageSize": 3, "displayOutput": "abstract", "channels": "WIIM"},
+        "ticker_param": "tickers",
+    },
+    "newsquantified": {
+        "path": "/api/v2/newsquantified",
+        "params": {"limit": 3},
+        "ticker_param": "tickers",
+    },
+    "unusual_options": {
+        "path": "/api/v1/signal/option_activity",
+        "params": {"limit": 3},
+        "ticker_param": "tickers",
+    },
+    "block_trades": {
+        "path": "/api/v1/signal/block_trade",
+        "params": {"limit": 3},
+        "ticker_param": "tickers",
+    },
+    "market_movers": {
+        "path": "/api/v1/market/movers",
+        "params": {"limit": 3},
+        "ticker_param": None,
+    },
+    "analyst_ratings": {
+        "path": "/api/v2.1/calendar/ratings",
+        "params": {"limit": 3},
+        "ticker_param": "tickers",
+    },
+    "ratings_firms": {
+        "path": "/api/v2.1/calendar/ratings/firms",
+        "params": {"limit": 3},
+        "ticker_param": None,
+    },
+    "consensus_ratings": {
+        "path": "/api/v1/consensus-ratings",
+        "params": {},
+        "ticker_param": "ticker",
+    },
+    # Calendar / risk products. If a candidate path is not included with the account,
+    # the capability endpoint marks it unavailable and the backend continues normally.
+    "earnings": {
+        "path": "/api/v2.1/calendar/earnings",
+        "params": {"limit": 3},
+        "ticker_param": "tickers",
+    },
+    "guidance": {
+        "path": "/api/v2.1/calendar/guidance",
+        "params": {"limit": 3},
+        "ticker_param": "tickers",
+    },
+    "offerings": {
+        "path": "/api/v2.1/calendar/offerings",
+        "params": {"limit": 3},
+        "ticker_param": "tickers",
+    },
+    "halts": {
+        "path": "/api/v2.1/calendar/halts",
+        "params": {"limit": 3},
+        "ticker_param": "tickers",
+    },
+    "fda": {
+        "path": "/api/v2.1/calendar/fda",
+        "params": {"limit": 3},
+        "ticker_param": "tickers",
+    },
+    "mna": {
+        "path": "/api/v2.1/calendar/ma",
+        "params": {"limit": 3},
+        "ticker_param": "tickers",
+    },
+    "dividends": {
+        "path": "/api/v2.1/calendar/dividends",
+        "params": {"limit": 3},
+        "ticker_param": "tickers",
+    },
+    "splits": {
+        "path": "/api/v2.1/calendar/splits",
+        "params": {"limit": 3},
+        "ticker_param": "tickers",
+    },
+    "short_interest": {
+        "path": "/api/v1/short-interest",
+        "params": {"limit": 3},
+        "ticker_param": "symbols",
+    },
+    "insider_transactions": {
+        "path": "/api/v1/sec/insider-transactions",
+        "params": {"limit": 3},
+        "ticker_param": "tickers",
+    },
+    "government_trades": {
+        "path": "/api/v1/government-trades",
+        "params": {"limit": 3},
+        "ticker_param": "tickers",
+    },
+}
+
+
+async def fetch_benzinga_news_for_ticker(ticker: str, page_size: int = 5) -> Dict[str, Any]:
+    """Compact one-ticker Benzinga News API check used by /test_benzinga."""
+    ticker = normalize_ticker(ticker)
+    timeout = BENZINGA_TIMEOUT
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        if not BENZINGA_API_KEY:
+            return {
+                "benzinga_available": False,
+                "ticker": ticker,
+                "headline_count": 0,
+                "top_headline": None,
+                "top_headline_url": None,
+                "created": None,
+                "updated": None,
+                "channels": [],
+                "stocks": [],
+                "importance_rank": None,
+                "error": "BENZINGA_API_KEY is not loaded",
+            }
+
+        params = {
+            "tickers": ticker,
+            "pageSize": max(1, min(page_size, 10)),
+            "displayOutput": "abstract",
+        }
+        query = dict(params)
+        query["token"] = BENZINGA_API_KEY
+        try:
+            resp = await client.get(
+                f"{BENZINGA_BASE}/api/v2/news",
+                params=query,
+                headers={"accept": "application/json"},
+            )
+        except Exception as e:
+            return {
+                "benzinga_available": False,
+                "ticker": ticker,
+                "headline_count": 0,
+                "top_headline": None,
+                "top_headline_url": None,
+                "created": None,
+                "updated": None,
+                "channels": [],
+                "stocks": [],
+                "importance_rank": None,
+                "error": str(e),
+            }
+
+        if resp.status_code != 200:
+            return {
+                "benzinga_available": False,
+                "ticker": ticker,
+                "headline_count": 0,
+                "top_headline": None,
+                "top_headline_url": None,
+                "created": None,
+                "updated": None,
+                "channels": [],
+                "stocks": [],
+                "importance_rank": None,
+                "error": f"HTTP {resp.status_code}: {resp.text[:250]}",
+            }
+
+        try:
+            data = resp.json()
+        except Exception:
+            return {
+                "benzinga_available": False,
+                "ticker": ticker,
+                "headline_count": 0,
+                "top_headline": None,
+                "top_headline_url": None,
+                "created": None,
+                "updated": None,
+                "channels": [],
+                "stocks": [],
+                "importance_rank": None,
+                "error": f"Non-JSON response: {resp.text[:250]}",
+            }
+
+    headlines = data if isinstance(data, list) else []
+    top = headlines[0] if headlines else {}
+    channels = [c.get("name") for c in (top.get("channels") or []) if isinstance(c, dict)] if top else []
+    stocks = [s.get("name") for s in (top.get("stocks") or []) if isinstance(s, dict)] if top else []
+
+    return {
+        "benzinga_available": True,
+        "ticker": ticker,
+        "headline_count": len(headlines),
+        "top_headline": top.get("title") if top else None,
+        "top_headline_url": top.get("url") if top else None,
+        "created": top.get("created") if top else None,
+        "updated": top.get("updated") if top else None,
+        "channels": channels[:10],
+        "stocks": stocks[:20],
+        "importance_rank": top.get("importance_rank") if top else None,
+        "error": None,
+    }
+
+
+@app.get("/test_benzinga")
+async def test_benzinga(ticker: str = "NVDA") -> Dict[str, Any]:
+    """Quick single-endpoint Benzinga News API test. Does not expose the API key."""
+    return await fetch_benzinga_news_for_ticker(ticker=ticker, page_size=5)
+
+
+@app.get("/test_benzinga_capabilities")
+async def test_benzinga_capabilities(ticker: str = "NVDA") -> Dict[str, Any]:
+    """Check which Benzinga product endpoints appear reachable for this API key.
+
+    This is intentionally a lightweight smoke test. A 200 with zero rows is labeled
+    "reachable_no_data" because the account may have access even if the chosen ticker
+    and time window do not return data.
+    """
+    ticker = normalize_ticker(ticker)
+    if not BENZINGA_API_KEY:
+        return {
+            "benzinga_api_key_loaded": False,
+            "ticker": ticker,
+            "capabilities": {},
+            "enabled_count": 0,
+            "disabled_count": len(BENZINGA_CAPABILITY_TESTS),
+            "note": "BENZINGA_API_KEY is not loaded in this Render service.",
+        }
+
+    results: Dict[str, Any] = {}
+    timeout = BENZINGA_TIMEOUT
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        for name, cfg in BENZINGA_CAPABILITY_TESTS.items():
+            params = dict(cfg.get("params") or {})
+            ticker_param = cfg.get("ticker_param")
+            if ticker_param:
+                params[ticker_param] = ticker
+            result = await benzinga_get(client, cfg["path"], params=params)
+            results[name] = {
+                "enabled": bool(result.get("enabled")),
+                "status": result.get("status"),
+                "status_code": result.get("status_code"),
+                "record_count": (result.get("summary") or {}).get("record_count"),
+                "data_type": (result.get("summary") or {}).get("data_type"),
+                "sample_keys": (result.get("summary") or {}).get("sample_keys"),
+                "path": cfg["path"],
+                "error": result.get("error"),
+            }
+            await asyncio.sleep(0.05)
+
+    enabled = [k for k, v in results.items() if v.get("enabled")]
+    disabled = [k for k, v in results.items() if not v.get("enabled")]
+
+    return {
+        "benzinga_api_key_loaded": True,
+        "ticker": ticker,
+        "capabilities": results,
+        "enabled_count": len(enabled),
+        "disabled_count": len(disabled),
+        "enabled": enabled,
+        "disabled": disabled,
+        "note": (
+            "This is a smoke test. 'reachable_no_data' means the endpoint returned HTTP 200 "
+            "but no rows for the test request; it may still be usable with different filters."
+        ),
+    }
+
+
+
 @app.get("/")
 def read_root() -> Dict[str, str]:
     return {"message": "Option Coach Backend is running."}
@@ -684,6 +1100,7 @@ def health() -> Dict[str, Any]:
     return {
         "ok": True,
         "polygon_api_key_loaded": bool(POLYGON_API_KEY),
+        "benzinga_api_key_loaded": bool(BENZINGA_API_KEY),
         "constituents_loaded": bool(INDEX_MAP),
         "universes_loaded": sorted(INDEX_MAP.keys()),
         "cache": cache_status(),
