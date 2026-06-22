@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import smtplib
 import ssl
 from datetime import datetime, timedelta, timezone
@@ -3278,6 +3279,82 @@ def benzinga_extract_rows(data: Any) -> List[Dict[str, Any]]:
     return []
 
 
+def _split_symbol_list(value: Any) -> List[str]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        out: List[str] = []
+        for item in value:
+            out.extend(_split_symbol_list(item))
+        return out
+    if isinstance(value, dict):
+        out: List[str] = []
+        for key in [
+            "ticker", "tickers", "symbol", "symbols", "name", "underlying",
+            "underlying_symbol", "root_symbol", "security_symbol", "stock",
+            "target_ticker", "acquirer_ticker", "company_ticker",
+        ]:
+            if key in value:
+                out.extend(_split_symbol_list(value.get(key)))
+        return out
+    text = str(value).upper().replace(";", ",").replace("|", ",")
+    return [x.strip() for x in text.split(",") if x.strip()]
+
+
+def _option_symbol_matches_ticker(symbol: str, ticker: str) -> bool:
+    symbol = str(symbol or "").upper().strip()
+    ticker = normalize_ticker(ticker)
+    if not symbol or not ticker:
+        return False
+    if symbol == ticker:
+        return True
+    # OCC-style option symbols often begin with the root, then a YYMMDD date.
+    # Example: AAPL260821C00250000. Avoid treating CAT as a match for CATH, etc.
+    return bool(re.match(rf"^{re.escape(ticker)}\d{{6}}[CP]", symbol))
+
+
+def benzinga_row_mentions_ticker(row: Dict[str, Any], ticker: str) -> bool:
+    """Strict local ticker filter for Benzinga rows.
+
+    Several Benzinga endpoints return broad data even when a ticker query parameter
+    is supplied. Recommendations must not score another ticker's options flow,
+    earnings, offerings, FDA, M&A, or ratings as if it belonged to the requested
+    symbol. This function only accepts explicit ticker/stock/symbol matches.
+    """
+    ticker = normalize_ticker(ticker)
+    if not isinstance(row, dict) or not ticker:
+        return False
+
+    explicit_fields = [
+        "ticker", "tickers", "symbol", "symbols", "stock", "stocks",
+        "underlying", "underlying_symbol", "root_symbol", "security_symbol",
+        "option_symbol", "target_ticker", "acquirer_ticker", "company_ticker",
+    ]
+
+    candidates: List[str] = []
+    for key in explicit_fields:
+        if key in row:
+            candidates.extend(_split_symbol_list(row.get(key)))
+
+    # Some calendars use slightly different names. Add a shallow scan for
+    # keys that clearly identify tickers/symbols without full-text matching.
+    for key, value in row.items():
+        lk = str(key).lower()
+        if any(token in lk for token in ["ticker", "symbol", "underlying"]):
+            candidates.extend(_split_symbol_list(value))
+
+    for candidate in candidates:
+        c = str(candidate or "").upper().strip()
+        if c == ticker or _option_symbol_matches_ticker(c, ticker):
+            return True
+
+    return False
+
+
+def filter_benzinga_rows_for_ticker(rows: List[Dict[str, Any]], ticker: str) -> List[Dict[str, Any]]:
+    return [row for row in rows if benzinga_row_mentions_ticker(row, ticker)]
+
+
 async def benzinga_raw_get(
     client: httpx.AsyncClient,
     path: str,
@@ -3344,6 +3421,16 @@ def classify_catalyst_type(text: str, channels: List[str]) -> str:
     return "news" if text.strip() else "none"
 
 
+def _text_has_term(blob: str, term: str) -> bool:
+    """Match catalyst terms without false hits like 'miss' inside 'dismisses'."""
+    term = term.lower().strip()
+    if not term:
+        return False
+    if " " in term or "-" in term:
+        return term in blob
+    return bool(re.search(rf"\b{re.escape(term)}\b", blob))
+
+
 def score_rows_text(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     if not rows:
         return {"score": 0.0, "label": "no_data", "positive_terms": [], "negative_terms": []}
@@ -3353,10 +3440,11 @@ def score_rows_text(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         "beats", "beat", "earnings beat", "contract", "partnership", "fda approval",
         "approval", "buy rating", "strong demand", "record revenue", "launches", "winner",
         "long ideas", "surges", "jumps", "rallies", "acquisition", "order", "selected",
+        "dismisses all litigation claims", "dismissed all litigation claims", "court dismisses",
     ]
     negative_terms = [
         "downgrade", "downgraded", "price target cut", "cuts price target", "cuts guidance",
-        "misses", "miss", "offering", "dilution", "lawsuit", "investigation", "bankruptcy",
+        "misses", "miss", "offering", "dilution", "investigation", "bankruptcy",
         "sell rating", "trading lower", "turnaround taking longer", "halt", "delisting",
         "loss widens", "revenue falls", "recall",
     ]
@@ -3370,13 +3458,23 @@ def score_rows_text(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         blob = f"{title} {body}".lower()
         weight = max(1.0, BENZINGA_MAX_ROWS - i) / BENZINGA_MAX_ROWS
         for term in positive_terms:
-            if term in blob:
+            if _text_has_term(blob, term):
                 raw += 12 * weight
                 matched_pos.append(term)
         for term in negative_terms:
-            if term in blob:
+            if _text_has_term(blob, term):
                 raw -= 15 * weight
                 matched_neg.append(term)
+
+        # Legal headlines need context. A dismissed claim can be positive for the defendant;
+        # a fresh lawsuit/investigation is negative. Avoid blindly penalizing every legal item.
+        if "lawsuit" in blob or "litigation" in blob:
+            if any(x in blob for x in ["dismisses", "dismissed", "non-infringement", "no infringement"]):
+                raw += 6 * weight
+                matched_pos.append("legal risk reduced")
+            elif any(x in blob for x in ["files lawsuit", "sues", "investigation", "probe"]):
+                raw -= 10 * weight
+                matched_neg.append("legal risk")
 
         importance = safe_float(row.get("importance_rank"))
         if importance >= 2:
@@ -3399,7 +3497,6 @@ def score_rows_text(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         "positive_terms": sorted(set(matched_pos))[:8],
         "negative_terms": sorted(set(matched_neg))[:8],
     }
-
 
 def summarize_news_rows(ticker: str, rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     rows = rows[:BENZINGA_MAX_ROWS]
@@ -3687,11 +3784,14 @@ async def fetch_benzinga_catalyst_summary(
     if not ticker or is_crypto_ticker(ticker):
         return {"enabled": bool(BENZINGA_API_KEY), "ticker": ticker, "final_benzinga_score": 0, "risk_flags": ["Benzinga equity catalyst not available for this symbol."]}
 
-    async def get_rows(path: str, params: Dict[str, Any]) -> List[Dict[str, Any]]:
+    async def get_rows(path: str, params: Dict[str, Any], *, strict_ticker_filter: bool = True) -> List[Dict[str, Any]]:
         result = await benzinga_raw_get(client, path, params)
         if not result.get("ok"):
             return []
-        return benzinga_extract_rows(result.get("data"))
+        rows = benzinga_extract_rows(result.get("data"))
+        if strict_ticker_filter:
+            rows = filter_benzinga_rows_for_ticker(rows, ticker)
+        return rows
 
     # Core catalyst endpoints. Keep limits compact to avoid slow scans.
     news_rows = await get_rows("/api/v2/news", {"tickers": ticker, "pageSize": 10, "displayOutput": "abstract"})
