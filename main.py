@@ -3645,6 +3645,37 @@ def summarize_options_activity(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
+
+def parse_benzinga_date(value: Any) -> Optional[datetime]:
+    if not value:
+        return None
+    text = str(value).strip()
+    # Common Benzinga calendar date formats include YYYY-MM-DD and RFC-style dates.
+    for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%m/%d/%Y"):
+        try:
+            return datetime.strptime(text[:10], fmt).replace(tzinfo=timezone.utc)
+        except Exception:
+            pass
+    try:
+        dt = parsedate_to_datetime(text)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def days_until_benzinga_date(value: Any) -> Optional[int]:
+    dt = parse_benzinga_date(value)
+    if not dt:
+        return None
+    return (dt.date() - datetime.now(timezone.utc).date()).days
+
+
+def benzinga_event_is_near(value: Any, max_days: int) -> bool:
+    days = days_until_benzinga_date(value)
+    return days is not None and 0 <= days <= max_days
+
 def summarize_calendar_rows(rows: List[Dict[str, Any]], kind: str) -> Dict[str, Any]:
     has = bool(rows)
     top = rows[0] if rows else {}
@@ -3663,17 +3694,22 @@ def summarize_calendar_rows(rows: List[Dict[str, Any]], kind: str) -> Dict[str, 
         }
 
     if kind == "earnings":
+        earnings_date = top.get("date") or top.get("report_date") if has else None
+        days_to_earnings = days_until_benzinga_date(earnings_date) if earnings_date else None
+        # Only flag actionable earnings risk when the event is near. A stale or far-future
+        # calendar row should not automatically punish today's premarket setup.
+        earnings_risk = days_to_earnings is not None and 0 <= days_to_earnings <= 10
         return {
-            "earnings_date": top.get("date") or top.get("report_date") if has else None,
+            "earnings_date": earnings_date,
             "earnings_time": top.get("time") or top.get("period") if has else "unknown",
-            "days_to_earnings": None,
+            "days_to_earnings": days_to_earnings,
             "eps_estimate": top.get("eps_est") or top.get("eps_estimate"),
             "eps_actual": top.get("eps") or top.get("eps_actual"),
             "eps_surprise_pct": top.get("eps_surprise_percent") or top.get("eps_surprise_pct"),
             "revenue_estimate": top.get("revenue_est") or top.get("revenue_estimate"),
             "revenue_actual": top.get("revenue") or top.get("revenue_actual"),
             "revenue_surprise_pct": top.get("revenue_surprise_percent") or top.get("revenue_surprise_pct"),
-            "earnings_risk_flag": has,
+            "earnings_risk_flag": earnings_risk,
         }
 
     if kind == "guidance":
@@ -3698,19 +3734,33 @@ def summarize_calendar_rows(rows: List[Dict[str, Any]], kind: str) -> Dict[str, 
         }
 
     if kind == "fda":
+        fda_date = top.get("date") if has else None
+        # FDA rows are mainly actionable for biotech/pharma names and near-dated events.
+        fda_risk = has and benzinga_event_is_near(fda_date, 30)
         return {
-            "fda_event_risk": has,
-            "fda_event_date": top.get("date") if has else None,
+            "fda_event_risk": fda_risk,
+            "fda_event_date": fda_date,
             "fda_event_type": top.get("type") or top.get("event_type"),
-            "fda_catalyst_score": 65 if has else 0,
+            "fda_catalyst_score": 65 if fda_risk else 0,
         }
 
     if kind == "mna":
+        status = top.get("deal_status") or top.get("status")
+        status_text = str(status or "").lower()
+        deal_price = top.get("deal_price") or top.get("price")
+        deal_value = top.get("deal_value") or top.get("value")
+        # Rumors are context, not automatic risk. Only hard-flag announced/definitive/pending
+        # transactions or rows with deal price/value.
+        actionable_mna = has and (
+            any(x in status_text for x in ["announced", "definitive", "pending", "completed"])
+            or bool(deal_price)
+            or bool(deal_value)
+        )
         return {
-            "mna_flag": has,
-            "deal_status": top.get("deal_status") or top.get("status"),
-            "deal_price": top.get("deal_price") or top.get("price"),
-            "deal_value": top.get("deal_value") or top.get("value"),
+            "mna_flag": actionable_mna,
+            "deal_status": status,
+            "deal_price": deal_price,
+            "deal_value": deal_value,
         }
 
     if kind == "halts":
@@ -3863,17 +3913,33 @@ async def fetch_benzinga_catalyst_summary(
     if insider.get("recent_insider_selling") and not insider.get("recent_insider_buying"):
         risk_flags.append("Recent insider selling detected")
 
-    positive_score = (
-        safe_float(news.get("news_catalyst_score")) * 0.22
-        + safe_float(wiim.get("wiim_score")) * 0.12
-        + safe_float(nq.get("news_impact_score")) * 0.08
-        + safe_float(options.get("options_flow_score")) * 0.20
-        + safe_float(analyst.get("analyst_catalyst_score")) * 0.14
-        + safe_float(guidance.get("guidance_surprise_score")) * 0.07
-        + safe_float(short_interest.get("short_squeeze_score")) * 0.05
-        + safe_float(blocks.get("block_trade_score")) * 0.05
-        + safe_float(insider.get("insider_activity_score")) * 0.07
-    )
+    # Build a weighted score only from sources that actually returned ticker-specific data.
+    # This avoids treating neutral default values from empty endpoints as real signals.
+    score_parts: List[tuple[float, float]] = []
+    if news_rows:
+        score_parts.append((safe_float(news.get("news_catalyst_score")), 0.30))
+    if wiim_rows:
+        score_parts.append((safe_float(wiim.get("wiim_score")), 0.14))
+    if nq_rows:
+        score_parts.append((safe_float(nq.get("news_impact_score")), 0.10))
+    if option_rows:
+        score_parts.append((safe_float(options.get("options_flow_score")), 0.20))
+    if ratings_rows:
+        score_parts.append((safe_float(analyst.get("analyst_catalyst_score")), 0.10))
+    if guidance_rows:
+        score_parts.append((safe_float(guidance.get("guidance_surprise_score")), 0.05))
+    if short_rows:
+        score_parts.append((safe_float(short_interest.get("short_squeeze_score")), 0.04))
+    if block_rows:
+        score_parts.append((safe_float(blocks.get("block_trade_score")), 0.03))
+    if insider_rows:
+        score_parts.append((safe_float(insider.get("insider_activity_score")), 0.04))
+
+    if score_parts:
+        weight_sum = sum(w for _, w in score_parts)
+        positive_score = sum(score * weight for score, weight in score_parts) / max(weight_sum, 0.01)
+    else:
+        positive_score = 0.0
 
     risk_penalty = 0.0
     if offerings.get("offering_flag"):
@@ -3892,12 +3958,14 @@ async def fetch_benzinga_catalyst_summary(
         risk_penalty += 10
 
     final_score = clamp(positive_score - risk_penalty)
-    if final_score >= 75:
+    if not score_parts and not risk_flags:
+        final_label = "no_benzinga_catalyst"
+    elif final_score >= 75:
         final_label = "strong_positive_catalyst"
     elif final_score >= 60:
         final_label = "positive_catalyst"
     elif final_score <= 25:
-        final_label = "high_risk_or_negative"
+        final_label = "high_risk_or_negative" if risk_flags else "no_or_weak_catalyst"
     elif final_score <= 40:
         final_label = "negative_or_weak_catalyst"
     else:
