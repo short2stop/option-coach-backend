@@ -3741,10 +3741,12 @@ async def premarket_brief(req: PremarketBriefRequest) -> Dict[str, Any]:
     if not INDEX_MAP and not req.tickers:
         raise HTTPException(status_code=500, detail="No constituents loaded. Put constituents.json next to main.py or pass explicit tickers.")
 
+    universes = ALL_UNIVERSES if req.universe == "all" else [req.universe]
+    universe_guard = await ensure_large_russell_universe_if_needed(universes)
+
     if req.refresh or not cache_is_fresh():
         await refresh_cache()
 
-    universes = ALL_UNIVERSES if req.universe == "all" else [req.universe]
     cache = cache_status()
 
     universe_blocks = [await build_premarket_brief_rows(req, universe) for universe in universes]
@@ -5545,6 +5547,7 @@ async def build_intraday_recommendation_rows(req: IntradayRecommendationRequest,
     )
     return {
         "universe": universe,
+        "universe_count": len(INDEX_MAP.get(universe, []) or []),
         "candidate_count": len(compact),
         "returned": min(req.limit, len(compact)),
         "signals": compact[:req.limit],
@@ -5638,6 +5641,8 @@ async def intraday_recommendations(req: IntradayRecommendationRequest) -> Dict[s
         "polygon_enabled": bool(POLYGON_API_KEY),
         "benzinga_enabled": bool(BENZINGA_API_KEY),
         "market_session_phase": phase,
+        "universe_guard": universe_guard,
+        "universe_counts": {k: len(v or []) for k, v in INDEX_MAP.items()},
         "cache": {
             "cached": cache.get("cached"),
             "fresh": cache.get("fresh"),
@@ -5650,7 +5655,7 @@ async def intraday_recommendations(req: IntradayRecommendationRequest) -> Dict[s
             "errors": (cache.get("errors") or [])[:5],
         },
         "methodology": {
-            "version": "intraday_recommendations_benzinga_v2_14_russell_auto_reload",
+            "version": "intraday_recommendations_benzinga_v2_15_russell_guard_enforced",
             "purpose": "Open-market intraday recommendations using live Polygon snapshots, premarket context, and Benzinga catalysts/options/risk events.",
             "cadence": "Run 1-5 minutes after the open and refresh every few minutes. Use refresh=true on the first call, then refresh=false for follow-ups unless the cache looks stale.",
             "inputs": [
