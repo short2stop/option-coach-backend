@@ -5448,31 +5448,48 @@ def compact_intraday_recommendation(sig: Dict[str, Any], premarket_context: Opti
     }
     row["action"] = classify_intraday_recommendation(row)
 
-    # Russell 2000 quality gate: small-cap names need a catalyst/flow/exceptional volume
-    # to rise above watch-only. This prevents pure percentage movers with no news/flow
-    # from crowding the top recommendations.
+    # Russell 2000 quality gate: small-cap names need catalyst/flow/volume-confirmed
+    # evidence before they can become buy-now candidates. Pure HOD momentum can remain
+    # on a Russell watch list, but it is never buy-eligible by itself.
     if str(universe).lower() == "russell2000":
         has_news = bool(row.get("top_headline")) or safe_float(row.get("news_catalyst_score")) >= 60 or safe_float(row.get("headline_count_1h")) > 0
         has_flow = safe_float(row.get("options_flow_score")) >= 65 and str(row.get("flow_direction") or "none").lower() not in {"none", "unclear"}
         has_exceptional_volume = safe_float(row.get("volume_anomaly_ratio")) >= 2.0
-        is_hod_break_quality = row.get("above_vwap") is True and safe_float(row.get("distance_from_hod_pct")) >= -0.5 and safe_float(row.get("intraday_change_pct")) >= 8.0
-        passes_quality_gate = has_news or has_flow or has_exceptional_volume or is_hod_break_quality
+        has_hod_break_quality = row.get("above_vwap") is True and safe_float(row.get("distance_from_hod_pct")) >= -0.5 and safe_float(row.get("intraday_change_pct")) >= 8.0
+
+        # Broader gate: allowed to appear as a Russell watch candidate.
+        passes_quality_gate = has_news or has_flow or has_exceptional_volume or has_hod_break_quality
+
+        # Stricter gate: allowed to become buy_now. HOD-only momentum does not qualify.
+        # A no-news/no-flow name must have BOTH exceptional volume and HOD-quality behavior.
+        buy_quality_passed = has_news or has_flow or (has_exceptional_volume and has_hod_break_quality)
 
         row["russell_quality_gate"] = {
             "passed": passes_quality_gate,
+            "buy_quality_passed": buy_quality_passed,
             "has_news": has_news,
             "has_options_flow": has_flow,
             "has_exceptional_volume": has_exceptional_volume,
-            "has_hod_break_quality": is_hod_break_quality,
+            "has_hod_break_quality": has_hod_break_quality,
+            "buy_now_rule": "news OR options_flow OR exceptional_volume_plus_hod_quality",
         }
+
+        row["support_factors"] = list(row.get("support_factors") or [])
+        row["risk_flags"] = list(row.get("risk_flags") or [])
+
         if not passes_quality_gate:
-            row["support_factors"] = list(row.get("support_factors") or [])
-            row["risk_flags"] = list(row.get("risk_flags") or [])
-            row["risk_flags"].append("Russell 2000 momentum without Benzinga catalyst, options flow, or exceptional volume")
+            row["risk_flags"].append("Russell 2000 momentum without Benzinga catalyst, options flow, exceptional volume, or HOD-quality confirmation")
             row["final_recommendation_score"] = min(safe_float(row.get("final_recommendation_score")), 49.9)
             row["action"] = "watch_only_no_catalyst_or_flow"
-        elif row.get("action") == "watch_only_confirmed_but_low_score" and safe_float(row.get("final_recommendation_score")) >= 55:
+        elif not buy_quality_passed:
+            row["risk_flags"].append("Russell 2000 HOD momentum is not buy-eligible without news, options flow, or exceptional volume")
+            row["final_recommendation_score"] = min(safe_float(row.get("final_recommendation_score")), 59.9)
             row["action"] = "russell_momentum_watch"
+        else:
+            # Buy-quality passed, but still do not force a buy. Let score/confirmation decide.
+            # Low-scoring confirmed names are promoted only to a Russell momentum watch.
+            if row.get("action") == "watch_only_confirmed_but_low_score" and safe_float(row.get("final_recommendation_score")) >= 55:
+                row["action"] = "russell_momentum_watch"
 
     return row
 
@@ -5660,7 +5677,7 @@ async def intraday_recommendations(req: IntradayRecommendationRequest) -> Dict[s
             "errors": (cache.get("errors") or [])[:5],
         },
         "methodology": {
-            "version": "intraday_recommendations_benzinga_v2_16_russell_guard_500_fix",
+            "version": "intraday_recommendations_benzinga_v2_17_russell_buy_quality",
             "purpose": "Open-market intraday recommendations using live Polygon snapshots, premarket context, and Benzinga catalysts/options/risk events.",
             "cadence": "Run 1-5 minutes after the open and refresh every few minutes. Use refresh=true on the first call, then refresh=false for follow-ups unless the cache looks stale.",
             "inputs": [
