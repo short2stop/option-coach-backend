@@ -5613,10 +5613,15 @@ async def intraday_recommendations(req: IntradayRecommendationRequest) -> Dict[s
     if not INDEX_MAP and not req.tickers:
         raise HTTPException(status_code=500, detail="No constituents loaded. Put constituents.json next to main.py or pass explicit tickers.")
 
+    universes = ALL_UNIVERSES if req.universe == "all" else [req.universe]
+
+    # v2.16: enforce the Russell universe guard BEFORE cache refresh and BEFORE row construction.
+    # v2.15 returned 500 because universe_guard was referenced but not assigned in this endpoint.
+    universe_guard = await ensure_large_russell_universe_if_needed(universes)
+
     if req.refresh or not cache_is_fresh():
         await refresh_cache()
 
-    universes = ALL_UNIVERSES if req.universe == "all" else [req.universe]
     cache = cache_status()
     phase = market_session_phase()
     expected = expected_grouped_market_date("intraday")
@@ -5655,7 +5660,7 @@ async def intraday_recommendations(req: IntradayRecommendationRequest) -> Dict[s
             "errors": (cache.get("errors") or [])[:5],
         },
         "methodology": {
-            "version": "intraday_recommendations_benzinga_v2_15_russell_guard_enforced",
+            "version": "intraday_recommendations_benzinga_v2_16_russell_guard_500_fix",
             "purpose": "Open-market intraday recommendations using live Polygon snapshots, premarket context, and Benzinga catalysts/options/risk events.",
             "cadence": "Run 1-5 minutes after the open and refresh every few minutes. Use refresh=true on the first call, then refresh=false for follow-ups unless the cache looks stale.",
             "inputs": [
