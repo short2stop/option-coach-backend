@@ -5349,7 +5349,7 @@ def compact_premarket_context_from_signal(sig: Dict[str, Any]) -> Dict[str, Any]
     }
 
 
-def compact_intraday_recommendation(sig: Dict[str, Any], premarket_context: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+def compact_intraday_recommendation(sig: Dict[str, Any], premarket_context: Optional[Dict[str, Any]] = None, universe: str = "") -> Dict[str, Any]:
     intraday = sig.get("intraday", {}) or {}
     trade = sig.get("trade_plan", {}) or {}
     history = sig.get("history", {}) or {}
@@ -5360,6 +5360,8 @@ def compact_intraday_recommendation(sig: Dict[str, Any], premarket_context: Opti
     intraday_quality = safe_float(sig.get("intraday_quality_score"))
     benz_score = safe_float(benz.get("final_benzinga_score"))
     premarket_score = safe_float(pre.get("premarket_quality_score"))
+    volume_anomaly_ratio = safe_float(history.get("volume_anomaly_ratio"))
+    prior_day_volume = safe_float(sig.get("volume"))
 
     risk_flags = [
         f for f in list(benz.get("risk_flags") or [])
@@ -5407,6 +5409,8 @@ def compact_intraday_recommendation(sig: Dict[str, Any], premarket_context: Opti
         "target_1": trade.get("target_1"),
         "target_2": trade.get("target_2"),
         "risk_reward": trade.get("reward_risk_to_target_2"),
+        "prior_day_volume": int(prior_day_volume) if prior_day_volume > 0 else None,
+        "volume_anomaly_ratio": round(volume_anomaly_ratio, 2) if volume_anomaly_ratio > 0 else None,
         "technical_score": round(historical_score, 1),
         "intraday_quality_score": sig.get("intraday_quality_score"),
         "premarket_quality_score": pre.get("premarket_quality_score"),
@@ -5438,6 +5442,33 @@ def compact_intraday_recommendation(sig: Dict[str, Any], premarket_context: Opti
         "reason": intraday.get("reason"),
     }
     row["action"] = classify_intraday_recommendation(row)
+
+    # Russell 2000 quality gate: small-cap names need a catalyst/flow/exceptional volume
+    # to rise above watch-only. This prevents pure percentage movers with no news/flow
+    # from crowding the top recommendations.
+    if str(universe).lower() == "russell2000":
+        has_news = bool(row.get("top_headline")) or safe_float(row.get("news_catalyst_score")) >= 60 or safe_float(row.get("headline_count_1h")) > 0
+        has_flow = safe_float(row.get("options_flow_score")) >= 65 and str(row.get("flow_direction") or "none").lower() not in {"none", "unclear"}
+        has_exceptional_volume = safe_float(row.get("volume_anomaly_ratio")) >= 2.0
+        is_hod_break_quality = row.get("above_vwap") is True and safe_float(row.get("distance_from_hod_pct")) >= -0.5 and safe_float(row.get("intraday_change_pct")) >= 8.0
+        passes_quality_gate = has_news or has_flow or has_exceptional_volume or is_hod_break_quality
+
+        row["russell_quality_gate"] = {
+            "passed": passes_quality_gate,
+            "has_news": has_news,
+            "has_options_flow": has_flow,
+            "has_exceptional_volume": has_exceptional_volume,
+            "has_hod_break_quality": is_hod_break_quality,
+        }
+        if not passes_quality_gate:
+            row["support_factors"] = list(row.get("support_factors") or [])
+            row["risk_flags"] = list(row.get("risk_flags") or [])
+            row["risk_flags"].append("Russell 2000 momentum without Benzinga catalyst, options flow, or exceptional volume")
+            row["final_recommendation_score"] = min(safe_float(row.get("final_recommendation_score")), 49.9)
+            row["action"] = "watch_only_no_catalyst_or_flow"
+        elif row.get("action") == "watch_only_confirmed_but_low_score" and safe_float(row.get("final_recommendation_score")) >= 55:
+            row["action"] = "russell_momentum_watch"
+
     return row
 
 
@@ -5497,10 +5528,11 @@ async def build_intraday_recommendation_rows(req: IntradayRecommendationRequest,
     compact = []
     for sig in signals:
         ticker = str(sig.get("ticker") or "").upper()
-        compact.append(compact_intraday_recommendation(sig, premarket_by_ticker.get(ticker)))
+        compact.append(compact_intraday_recommendation(sig, premarket_by_ticker.get(ticker), universe))
 
     compact.sort(
         key=lambda x: (
+            1 if (x.get("russell_quality_gate") or {}).get("passed") is True else 0,
             safe_float(x.get("final_recommendation_score")),
             1 if x.get("intraday_confirmed") is True else 0,
             safe_float(x.get("intraday_quality_score")),
@@ -5562,12 +5594,13 @@ async def intraday_recommendations(req: IntradayRecommendationRequest) -> Dict[s
             "errors": (cache.get("errors") or [])[:5],
         },
         "methodology": {
-            "version": "intraday_recommendations_benzinga_v2_10",
+            "version": "intraday_recommendations_benzinga_v2_13_russell_quality",
             "purpose": "Open-market intraday recommendations using live Polygon snapshots, premarket context, and Benzinga catalysts/options/risk events.",
             "cadence": "Run 1-5 minutes after the open and refresh every few minutes. Use refresh=true on the first call, then refresh=false for follow-ups unless the cache looks stale.",
             "inputs": [
                 "live current price", "VWAP", "HOD/LOD distance", "intraday confirmation",
                 "prior premarket setup", "Benzinga news/WIIM", "Benzinga options flow",
+                "Russell 2000 quality gate requiring catalyst/flow/exceptional volume",
                 "analyst/earnings/guidance/offering/halt/short-interest/insider context",
             ],
             "excluded_sources": ["government_trades", "mna_scoring_in_production"],
@@ -5594,6 +5627,11 @@ async def intraday_recommendations(req: IntradayRecommendationRequest) -> Dict[s
                 {"ticker": r.get("ticker"), "action": r.get("action"), "score": r.get("final_recommendation_score")}
                 for r in all_rows
                 if "vwap" in str(r.get("action"))
+            ][:10],
+            "russell_quality_watch": [
+                {"ticker": r.get("ticker"), "action": r.get("action"), "score": r.get("final_recommendation_score"), "quality_gate": r.get("russell_quality_gate")}
+                for r in all_rows
+                if str(r.get("action")) in {"russell_momentum_watch", "watch_only_no_catalyst_or_flow"}
             ][:10],
             "avoid": [
                 {"ticker": r.get("ticker"), "action": r.get("action"), "risk_flags": r.get("risk_flags")}
