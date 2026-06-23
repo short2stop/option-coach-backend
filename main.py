@@ -7,6 +7,7 @@ import re
 import smtplib
 import ssl
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from uuid import uuid4
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional
@@ -156,16 +157,59 @@ def previous_us_market_trading_day(day=None) -> str:
     return d.isoformat()
 
 
+EASTERN_TZ = ZoneInfo("America/New_York")
+
+
+def now_et() -> datetime:
+    return datetime.now(EASTERN_TZ)
+
+
+def market_session_phase(dt_et: Optional[datetime] = None) -> str:
+    dt = dt_et or now_et()
+    if not is_us_market_trading_day(dt.date()):
+        return "closed_non_trading_day"
+    minutes = dt.hour * 60 + dt.minute
+    if minutes < 4 * 60:
+        return "overnight"
+    if minutes < 9 * 60 + 30:
+        return "premarket"
+    if minutes < 16 * 60:
+        return "regular_market"
+    if minutes < 20 * 60:
+        return "after_hours"
+    return "closed_after_hours"
+
+
+def expected_grouped_market_date(mode: str = "auto", dt_et: Optional[datetime] = None) -> str:
+    """Return the expected Polygon grouped-daily market date.
+
+    Premarket scans intentionally use the prior completed trading day for gap math.
+    Intraday/post-close scans can use today's grouped data only after the regular
+    session closes and Polygon has published the grouped rows.
+    """
+    dt = dt_et or now_et()
+    today = dt.date()
+    phase = market_session_phase(dt)
+    if mode in {"intraday", "post_close", "auto"} and is_us_market_trading_day(today) and phase in {"after_hours", "closed_after_hours"}:
+        return today.isoformat()
+    return previous_us_market_trading_day(today)
+
+
 def recent_market_dates(days_back: int = 10) -> List[str]:
-    # Try recent real U.S. market trading days. This skips weekends and known full-market holidays
-    # such as Juneteenth, preventing false stale warnings and noisy Polygon errors.
+    # Try recent real U.S. market trading days. This skips weekends and known full-market holidays.
+    # After 4:00 PM ET on a trading day, try today's grouped rows first; if Polygon has not
+    # published them yet, fetch_grouped_stocks will fall back to the prior valid trading day.
     dates: List[str] = []
-    d = datetime.now(timezone.utc).date()
+    dt = now_et()
+    d = dt.date()
+    if is_us_market_trading_day(d) and market_session_phase(dt) in {"after_hours", "closed_after_hours"}:
+        dates.append(d.isoformat())
     for i in range(1, days_back + 1):
         candidate = d - timedelta(days=i)
         if is_us_market_trading_day(candidate):
             dates.append(candidate.isoformat())
-    return dates
+    # preserve order while deduping
+    return list(dict.fromkeys(dates))
 
 
 async def fetch_grouped_stocks(client: httpx.AsyncClient) -> tuple[Dict[str, Dict[str, Any]], Optional[str], List[str]]:
@@ -4784,4 +4828,321 @@ async def daily_report(req: DailyReportRequest) -> Dict[str, Any]:
             ][: req.limit],
         },
         "preview_text": text_body[:4000],
+    }
+
+
+# -------------------------
+# Benzinga-powered intraday recommendation layer v1
+# -------------------------
+
+class IntradayRecommendationRequest(BaseModel):
+    universe: Literal["sp500", "dow30", "nasdaq100", "russell2000", "crypto", "watchlist", "all"] = "sp500"
+    horizon: Literal["1d", "1w", "1mo"] = "1d"
+    tickers: Optional[List[str]] = Field(default=None, description="Optional explicit ticker list")
+    refresh: bool = Field(default=False, description="Force a cache refresh before returning recommendations")
+    limit: int = Field(default=10, ge=1, le=50, description="Maximum number of ranked candidates to return")
+    min_price: float = Field(default=0.0, ge=0.0, description="Minimum underlying price")
+    min_volume: float = Field(default=0.0, ge=0.0, description="Minimum share volume")
+    include_benzinga: bool = True
+    include_options_flow: bool = True
+    include_risk_events: bool = True
+    include_premarket_context: bool = True
+    strategy: Literal["opening_confirmation", "rebound_and_momentum", "vwap_reclaim"] = "opening_confirmation"
+
+
+def classify_intraday_recommendation(row: Dict[str, Any]) -> str:
+    intraday_confirmed = row.get("intraday_confirmed") is True
+    above_vwap = row.get("above_vwap") is True
+    change_pct = safe_float(row.get("intraday_change_pct"))
+    dist_hod = safe_float(row.get("distance_from_hod_pct"))
+    final_score = safe_float(row.get("final_recommendation_score"))
+    flow_dir = str(row.get("flow_direction") or "none").lower()
+    risk_flags = row.get("risk_flags") or []
+
+    if any("Offering" in str(x) or "Halt" in str(x) or "Lowered guidance" in str(x) for x in risk_flags):
+        return "avoid_event_risk"
+    if flow_dir == "bearish":
+        return "avoid_bearish_options_flow"
+    if change_pct <= -1.0 or (not above_vwap and dist_hod < -2.5):
+        return "avoid_or_wait_for_reclaim"
+    if final_score >= 78 and intraday_confirmed and above_vwap and dist_hod >= -1.0:
+        return "buy_now_confirmed_momentum"
+    if final_score >= 70 and intraday_confirmed and above_vwap:
+        return "opening_range_break_candidate"
+    if final_score >= 62 and above_vwap and dist_hod >= -1.5:
+        return "vwap_hold_watch"
+    if final_score >= 55 and not above_vwap:
+        return "vwap_reclaim_watch"
+    if intraday_confirmed:
+        return "watch_only_confirmed_but_low_score"
+    return "watch_only"
+
+
+def compact_premarket_context_from_signal(sig: Dict[str, Any]) -> Dict[str, Any]:
+    pre = sig.get("premarket", {}) or {}
+    return {
+        "premarket_price": pre.get("premarket_price"),
+        "gap_pct": pre.get("gap_pct"),
+        "premarket_volume": pre.get("premarket_volume"),
+        "premarket_high": pre.get("premarket_high"),
+        "premarket_low": pre.get("premarket_low"),
+        "distance_from_premarket_high_pct": pre.get("distance_from_premarket_high_pct"),
+        "premarket_setup": pre.get("premarket_setup"),
+        "opening_strategy": pre.get("opening_strategy"),
+        "premarket_quality_score": sig.get("premarket_quality_score"),
+    }
+
+
+def compact_intraday_recommendation(sig: Dict[str, Any], premarket_context: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    intraday = sig.get("intraday", {}) or {}
+    trade = sig.get("trade_plan", {}) or {}
+    history = sig.get("history", {}) or {}
+    benz = sig.get("benzinga", {}) or {}
+    pre = premarket_context or {}
+
+    historical_score = safe_float(sig.get("historical_score", sig.get("overall_score")))
+    intraday_quality = safe_float(sig.get("intraday_quality_score"))
+    benz_score = safe_float(benz.get("final_benzinga_score"))
+    premarket_score = safe_float(pre.get("premarket_quality_score"))
+
+    risk_flags = [
+        f for f in list(benz.get("risk_flags") or [])
+        if "M&A" not in str(f) and "deal event" not in str(f)
+    ]
+
+    penalty = 0.0
+    if any("Offering" in f for f in risk_flags):
+        penalty += 25
+    if any("Halt" in f for f in risk_flags):
+        penalty += 30
+    if str(benz.get("flow_direction") or "").lower() == "bearish":
+        penalty += 18
+    if intraday.get("above_vwap") is False:
+        penalty += 10
+    if safe_float(intraday.get("distance_from_high_pct")) < -2:
+        penalty += 8
+
+    # Intraday is intentionally dominant after the open. Premarket context and Benzinga
+    # refine the ranking but do not override failed live price action.
+    final_score = clamp(
+        intraday_quality * 0.42
+        + historical_score * 0.18
+        + benz_score * 0.26
+        + premarket_score * 0.14
+        - penalty
+    )
+
+    row = {
+        "ticker": sig.get("ticker"),
+        "action": None,
+        "final_recommendation_score": round(final_score, 1),
+        "current_price": intraday.get("current_price"),
+        "open": intraday.get("open"),
+        "vwap": intraday.get("day_vwap"),
+        "above_vwap": intraday.get("above_vwap"),
+        "intraday_change_pct": intraday.get("intraday_change_pct"),
+        "distance_from_hod_pct": intraday.get("distance_from_high_pct"),
+        "distance_from_lod_pct": round(((safe_float(intraday.get("current_price")) - safe_float(intraday.get("low"))) / safe_float(intraday.get("low")) * 100), 2) if safe_float(intraday.get("low")) > 0 else None,
+        "intraday_confirmed": sig.get("intraday_confirmed"),
+        "entry_status": sig.get("entry_status"),
+        "live_entry": trade.get("entry"),
+        "entry_basis": trade.get("entry_basis"),
+        "stop": trade.get("stop"),
+        "target_1": trade.get("target_1"),
+        "target_2": trade.get("target_2"),
+        "risk_reward": trade.get("reward_risk_to_target_2"),
+        "technical_score": round(historical_score, 1),
+        "intraday_quality_score": sig.get("intraday_quality_score"),
+        "premarket_quality_score": pre.get("premarket_quality_score"),
+        "premarket_setup": pre.get("premarket_setup"),
+        "premarket_gap_pct": pre.get("gap_pct"),
+        "premarket_high": pre.get("premarket_high"),
+        "distance_from_premarket_high_pct": pre.get("distance_from_premarket_high_pct"),
+        "benzinga_score": benz.get("final_benzinga_score", 0),
+        "benzinga_label": benz.get("final_benzinga_label"),
+        "news_catalyst_score": benz.get("news_catalyst_score", 0),
+        "news_catalyst_label": benz.get("news_catalyst_label"),
+        "top_headline": benz.get("top_headline"),
+        "why_moving": benz.get("why_moving"),
+        "headline_count_1h": benz.get("headline_count_1h", 0),
+        "news_recency_minutes": benz.get("news_recency_minutes"),
+        "options_flow_score": benz.get("options_flow_score", 0),
+        "flow_direction": benz.get("flow_direction"),
+        "call_put_ratio": benz.get("call_put_ratio"),
+        "analyst_catalyst_score": benz.get("analyst_catalyst_score", 0),
+        "earnings_risk_flag": benz.get("earnings_risk_flag", False),
+        "offering_flag": benz.get("offering_flag", False),
+        "halt_flag": benz.get("halt_flag", False),
+        "short_squeeze_score": benz.get("short_squeeze_score", 0),
+        "insider_activity_score": benz.get("insider_activity_score", 0),
+        "support_factors": benz.get("support_factors") or [],
+        "risk_flags": risk_flags,
+        "risk_profile": sig.get("risk_profile"),
+        "setup": sig.get("setup"),
+        "reason": intraday.get("reason"),
+    }
+    row["action"] = classify_intraday_recommendation(row)
+    return row
+
+
+async def build_intraday_recommendation_rows(req: IntradayRecommendationRequest, universe: str) -> Dict[str, Any]:
+    sig_req = SignalsRequest(
+        universe=universe,
+        horizon=req.horizon,
+        tickers=req.tickers,
+        refresh=False,
+        limit=req.limit,
+        min_price=req.min_price,
+        min_volume=req.min_volume,
+        include_news_catalysts=False,
+    )
+    block = await build_signal_rows(sig_req, universe)
+    signals = block.get("signals", []) or []
+
+    premarket_by_ticker: Dict[str, Dict[str, Any]] = {}
+    if req.include_premarket_context and signals:
+        pre_req = PremarketRequest(
+            universe=universe,
+            horizon=req.horizon,
+            tickers=[str(s.get("ticker") or "").upper() for s in signals if s.get("ticker")],
+            refresh=False,
+            limit=max(req.limit, len(signals)),
+            min_price=req.min_price,
+            min_volume=0,
+            min_premarket_volume=0,
+        )
+        pre_req.include_news_catalysts = False
+        try:
+            pre_block = await build_premarket_rows(pre_req, universe)
+            for ps in pre_block.get("signals", []) or []:
+                t = str(ps.get("ticker") or "").upper()
+                if t:
+                    premarket_by_ticker[t] = compact_premarket_context_from_signal(ps)
+        except Exception:
+            premarket_by_ticker = {}
+
+    if req.include_benzinga and signals:
+        semaphore = asyncio.Semaphore(4)
+        async with httpx.AsyncClient(timeout=BENZINGA_TIMEOUT) as client:
+            async def one(sig: Dict[str, Any]) -> Dict[str, Any]:
+                ticker = str(sig.get("ticker") or "").upper()
+                async with semaphore:
+                    sig["benzinga"] = await fetch_benzinga_catalyst_summary(
+                        client,
+                        ticker,
+                        include_options_flow=req.include_options_flow,
+                        include_risk_events=req.include_risk_events,
+                    )
+                    await asyncio.sleep(0.05)
+                    return sig
+            updated = await asyncio.gather(*(one(s) for s in signals), return_exceptions=True)
+            signals = [x for x in updated if isinstance(x, dict)]
+
+    compact = []
+    for sig in signals:
+        ticker = str(sig.get("ticker") or "").upper()
+        compact.append(compact_intraday_recommendation(sig, premarket_by_ticker.get(ticker)))
+
+    compact.sort(
+        key=lambda x: (
+            safe_float(x.get("final_recommendation_score")),
+            1 if x.get("intraday_confirmed") is True else 0,
+            safe_float(x.get("intraday_quality_score")),
+            safe_float(x.get("benzinga_score")),
+        ),
+        reverse=True,
+    )
+    return {
+        "universe": universe,
+        "candidate_count": len(compact),
+        "returned": min(req.limit, len(compact)),
+        "signals": compact[:req.limit],
+        "skipped": (block.get("skipped") or [])[:25],
+    }
+
+
+@app.post("/intraday_recommendations")
+async def intraday_recommendations(req: IntradayRecommendationRequest) -> Dict[str, Any]:
+    if not INDEX_MAP and not req.tickers:
+        raise HTTPException(status_code=500, detail="No constituents loaded. Put constituents.json next to main.py or pass explicit tickers.")
+
+    if req.refresh or not cache_is_fresh():
+        await refresh_cache()
+
+    universes = ALL_UNIVERSES if req.universe == "all" else [req.universe]
+    cache = cache_status()
+    phase = market_session_phase()
+    expected = expected_grouped_market_date("intraday")
+    cache_date = str(cache.get("market_date") or "")[:10] if cache.get("market_date") else None
+    post_close_data_pending = phase in {"after_hours", "closed_after_hours"} and cache_date != expected
+
+    universe_blocks = [await build_intraday_recommendation_rows(req, universe) for universe in universes]
+    all_rows: List[Dict[str, Any]] = []
+    for block in universe_blocks:
+        all_rows.extend(block.get("signals", []) or [])
+    all_rows.sort(key=lambda x: safe_float(x.get("final_recommendation_score")), reverse=True)
+
+    market_data_warning = False
+    market_data_reason = None
+    if post_close_data_pending:
+        market_data_warning = True
+        market_data_reason = "Market is closed, but today's grouped Polygon data is not available yet; live snapshot fields are still used where available."
+
+    return {
+        "horizon": req.horizon,
+        "strategy": req.strategy,
+        "polygon_enabled": bool(POLYGON_API_KEY),
+        "benzinga_enabled": bool(BENZINGA_API_KEY),
+        "market_session_phase": phase,
+        "cache": {
+            "cached": cache.get("cached"),
+            "fresh": cache.get("fresh"),
+            "generated_at": cache.get("generated_at"),
+            "market_date": cache.get("market_date"),
+            "expected_market_date": expected,
+            "post_close_data_pending": post_close_data_pending,
+            "market_data_warning": market_data_warning,
+            "market_data_reason": market_data_reason,
+            "errors": (cache.get("errors") or [])[:5],
+        },
+        "methodology": {
+            "version": "intraday_recommendations_benzinga_v1",
+            "purpose": "Open-market intraday recommendations using live Polygon snapshots, premarket context, and Benzinga catalysts/options/risk events.",
+            "cadence": "Run 1-5 minutes after the open and refresh every few minutes. Use refresh=true on the first call, then refresh=false for follow-ups unless the cache looks stale.",
+            "inputs": [
+                "live current price", "VWAP", "HOD/LOD distance", "intraday confirmation",
+                "prior premarket setup", "Benzinga news/WIIM", "Benzinga options flow",
+                "analyst/earnings/guidance/offering/halt/short-interest/insider context",
+            ],
+            "excluded_sources": ["government_trades", "mna_scoring_in_production"],
+        },
+        "universes": universe_blocks,
+        "summary": {
+            "top_recommendations": [
+                {
+                    "ticker": r.get("ticker"),
+                    "action": r.get("action"),
+                    "score": r.get("final_recommendation_score"),
+                    "current_price": r.get("current_price"),
+                    "above_vwap": r.get("above_vwap"),
+                    "intraday_change_pct": r.get("intraday_change_pct"),
+                    "distance_from_hod_pct": r.get("distance_from_hod_pct"),
+                    "benzinga_score": r.get("benzinga_score"),
+                    "flow_direction": r.get("flow_direction"),
+                    "top_headline": r.get("top_headline"),
+                }
+                for r in all_rows[: min(10, len(all_rows))]
+            ],
+            "buy_now": [r for r in all_rows if str(r.get("action")) == "buy_now_confirmed_momentum"][:10],
+            "vwap_reclaim_watch": [
+                {"ticker": r.get("ticker"), "action": r.get("action"), "score": r.get("final_recommendation_score")}
+                for r in all_rows
+                if "vwap" in str(r.get("action"))
+            ][:10],
+            "avoid": [
+                {"ticker": r.get("ticker"), "action": r.get("action"), "risk_flags": r.get("risk_flags")}
+                for r in all_rows
+                if str(r.get("action", "")).startswith("avoid")
+            ][:10],
+        },
     }
