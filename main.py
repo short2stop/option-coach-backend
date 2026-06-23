@@ -844,6 +844,37 @@ def _csv_symbols(text: str, preferred_columns: List[str]) -> List[str]:
     return _unique_symbols(out)
 
 
+def _plain_symbol_lines(text: str) -> List[str]:
+    """Parse a one-symbol-per-line holdings file, e.g. index ETF symbol lists."""
+    out: List[str] = []
+    for line in str(text or "").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        # Only use the first CSV/whitespace token so it also handles rough text files.
+        token = re.split(r"[,\s]+", line)[0]
+        t = _clean_symbol(token)
+        if t:
+            out.append(t)
+    return _unique_symbols(out)
+
+
+
+def _russell_components_csv_symbols(text: str) -> List[str]:
+    """Parse public Russell 2000 component CSV files with ticker/name columns."""
+    syms = _csv_symbols(text, ["ticker", "Ticker", "symbol", "Symbol"])
+    if len(syms) >= 1500:
+        return syms
+    # Fallback: first column frequently contains ticker even if headers vary.
+    out: List[str] = []
+    for row in csv.reader(io.StringIO(str(text or ""))):
+        if not row:
+            continue
+        t = _clean_symbol(row[0])
+        if t and t not in {"TICKER", "SYMBOL"}:
+            out.append(t)
+    return _unique_symbols(out)
+
 
 
 def _ishares_holdings_symbols(text: str) -> List[str]:
@@ -1002,6 +1033,11 @@ async def fetch_live_constituents(include_russell2000: bool = True) -> Dict[str,
         "russell2000_alt": "https://www.ishares.com/us/products/239710/ishares-russell-2000-etf/1467271812596.ajax?fileType=csv&fileName=IWM_holdings&dataType=fund",
         "russell2000_blackrock": "https://www.blackrock.com/us/individual/products/239710/ishares-russell-2000-etf?fileType=csv&fileName=IWM_holdings&dataType=fund",
         "russell2000_blackrock_ajax": "https://www.blackrock.com/us/individual/products/239710/ishares-russell-2000-etf/1467271812596.ajax?fileType=csv&fileName=IWM_holdings&dataType=fund",
+        # Fallback public text/CSV lists. These are used only if BlackRock/iShares
+        # returns an HTML/partial response in Render. They are less official than
+        # BlackRock but much better than preserving a 10-name hand list.
+        "russell2000_github_iwm_txt": "https://raw.githubusercontent.com/major/index-etfs/main/iwm.txt",
+        "russell2000_github_components_csv": "https://raw.githubusercontent.com/ikoniaris/Russell2000/master/russell_2000_components.csv",
     }
     current = {k: list(v) for k, v in INDEX_MAP.items()}
     results: Dict[str, Any] = {}
@@ -1044,24 +1080,62 @@ async def fetch_live_constituents(include_russell2000: bool = True) -> Dict[str,
         except Exception as e:
             errors.append(f"dow30 refresh failed: {type(e).__name__}: {e}")
 
-        # Russell 2000 via IWM holdings. This is a practical complete-tradable universe, not a tiny watchlist.
+        # Russell 2000 via IWM holdings first, then public fallback lists. This is a
+        # practical complete-tradable universe, not a tiny watchlist. Render sometimes
+        # receives a partial BlackRock response, so we explicitly fall back to raw GitHub
+        # symbol lists before preserving the old local file.
         if include_russell2000:
             russell_result = None
-            for label in ["russell2000_primary", "russell2000_alt", "russell2000_blackrock", "russell2000_blackrock_ajax"]:
+            russell_attempts: List[Dict[str, Any]] = []
+            labels = [
+                "russell2000_primary",
+                "russell2000_alt",
+                "russell2000_blackrock",
+                "russell2000_blackrock_ajax",
+                "russell2000_github_iwm_txt",
+                "russell2000_github_components_csv",
+            ]
+            for label in labels:
                 try:
                     text = await _fetch_text(client, sources[label])
-                    r2k = _ishares_holdings_symbols(text)
-                    if len(r2k) < 1500:
-                        # If the CSV parser did not catch the download format, try embedded page text fallback.
-                        r2k = _try_extract_js_json_symbols(text, ["ticker", "localExchangeTicker"])
+                    if label == "russell2000_github_iwm_txt":
+                        r2k = _plain_symbol_lines(text)
+                        proxy = "IWM_symbol_list_fallback"
+                    elif label == "russell2000_github_components_csv":
+                        r2k = _russell_components_csv_symbols(text)
+                        proxy = "russell2000_components_fallback"
+                    else:
+                        r2k = _ishares_holdings_symbols(text)
+                        if len(r2k) < 1500:
+                            # If the CSV parser did not catch the download format, try embedded page text fallback.
+                            r2k = _try_extract_js_json_symbols(text, ["ticker", "localExchangeTicker"])
+                        proxy = "IWM_holdings"
+
+                    attempt = {"label": label, "count": len(r2k), "source": sources[label], "proxy": proxy}
+                    russell_attempts.append(attempt)
                     if len(r2k) >= 1500:
                         current["russell2000"] = r2k
-                        russell_result = {"count": len(r2k), "source": sources[label], "status": "updated", "proxy": "IWM_holdings"}
+                        russell_result = {
+                            "count": len(r2k),
+                            "source": sources[label],
+                            "status": "updated",
+                            "proxy": proxy,
+                            "attempts": russell_attempts,
+                        }
                         break
-                    russell_result = {"count": len(r2k), "source": sources[label], "status": "ignored_low_count", "proxy": "IWM_holdings"}
+                    russell_result = {
+                        "count": len(r2k),
+                        "source": sources[label],
+                        "status": "ignored_low_count",
+                        "proxy": proxy,
+                        "attempts": russell_attempts,
+                    }
                 except Exception as e:
                     errors.append(f"russell2000 refresh failed from {label}: {type(e).__name__}: {e}")
             if russell_result:
+                # Do not overwrite an existing local Russell list unless one source
+                # produced a realistically broad list. The response includes attempts
+                # so we can see exactly which source failed or succeeded.
                 results["russell2000"] = russell_result
 
     # Preserve custom universes from local file. Russell 2000 is preserved only if refresh failed/was disabled.
