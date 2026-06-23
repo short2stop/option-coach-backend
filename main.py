@@ -1786,10 +1786,12 @@ async def screen(req: ScreenRequest) -> Dict[str, Any]:
     if not INDEX_MAP and not req.tickers:
         raise HTTPException(status_code=500, detail="No constituents loaded. Put constituents.json next to main.py or pass explicit tickers.")
 
+    universes = ALL_UNIVERSES if req.universe == "all" else [req.universe]
+    universe_guard = await ensure_large_russell_universe_if_needed(universes)
+
     if req.refresh or not cache_is_fresh():
         await refresh_cache()
 
-    universes = ALL_UNIVERSES if req.universe == "all" else [req.universe]
     return {
         "horizon": req.horizon,
         "polygon_enabled": bool(POLYGON_API_KEY),
@@ -4960,6 +4962,7 @@ async def build_premarket_recommendation_rows(req: PremarketRecommendationReques
 
     return {
         "universe": universe,
+        "universe_count": len(INDEX_MAP.get(universe, []) or []),
         "candidate_count": len(compact),
         "returned": min(req.limit, len(compact)),
         "signals": compact[:req.limit],
@@ -5549,6 +5552,59 @@ async def build_intraday_recommendation_rows(req: IntradayRecommendationRequest,
     }
 
 
+async def ensure_large_russell_universe_if_needed(universes: List[str]) -> Dict[str, Any]:
+    """
+    Guardrail for Render redeploys: if constituents.json reverts to an old
+    10-name Russell fallback, refresh/reload the broad Russell/IWM proxy before scanning.
+    """
+    global INDEX_MAP
+    normalized_universes = {str(u or "").lower() for u in universes}
+    needs_russell = "russell2000" in normalized_universes or "all" in normalized_universes
+    current_count = len(INDEX_MAP.get("russell2000", []) or [])
+    result: Dict[str, Any] = {
+        "checked": needs_russell,
+        "before_count": current_count,
+        "after_count": current_count,
+        "refreshed": False,
+        "status": "not_needed" if not needs_russell else "ok",
+    }
+    if not needs_russell:
+        return result
+
+    # First reload disk in case /refresh_constituents already wrote the file but
+    # this worker still has an old in-memory INDEX_MAP.
+    if current_count < 1500:
+        disk_map = load_constituents()
+        disk_count = len(disk_map.get("russell2000", []) or []) if disk_map else 0
+        if disk_count > current_count:
+            INDEX_MAP = disk_map
+            current_count = disk_count
+            result["after_count"] = current_count
+            result["status"] = "reloaded_from_disk"
+
+    # If still too small, run the same broad refresh used by /refresh_constituents.
+    # Persist it so the next request sees the large universe immediately.
+    if current_count < 1500:
+        refreshed = await fetch_live_constituents(include_russell2000=True)
+        INDEX_MAP = refreshed.get("index_map") or INDEX_MAP
+        try:
+            save_constituents(INDEX_MAP)
+            persisted = True
+        except Exception as e:
+            persisted = False
+            result["persist_error"] = f"{type(e).__name__}: {e}"
+        after_count = len(INDEX_MAP.get("russell2000", []) or [])
+        result.update({
+            "after_count": after_count,
+            "refreshed": True,
+            "persisted": persisted,
+            "status": "updated" if after_count >= 1500 else "still_low_count",
+            "refresh_results": refreshed.get("results", {}),
+            "refresh_errors": refreshed.get("errors", []),
+        })
+    return result
+
+
 @app.post("/intraday_recommendations")
 async def intraday_recommendations(req: IntradayRecommendationRequest) -> Dict[str, Any]:
     if not INDEX_MAP and not req.tickers:
@@ -5594,7 +5650,7 @@ async def intraday_recommendations(req: IntradayRecommendationRequest) -> Dict[s
             "errors": (cache.get("errors") or [])[:5],
         },
         "methodology": {
-            "version": "intraday_recommendations_benzinga_v2_13_russell_quality",
+            "version": "intraday_recommendations_benzinga_v2_14_russell_auto_reload",
             "purpose": "Open-market intraday recommendations using live Polygon snapshots, premarket context, and Benzinga catalysts/options/risk events.",
             "cadence": "Run 1-5 minutes after the open and refresh every few minutes. Use refresh=true on the first call, then refresh=false for follow-ups unless the cache looks stale.",
             "inputs": [
