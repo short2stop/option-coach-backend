@@ -796,9 +796,20 @@ class WatchlistUpdateRequest(BaseModel):
 
 
 async def _fetch_text(client: httpx.AsyncClient, url: str) -> str:
-    resp = await client.get(url, headers={"User-Agent": "OptionCoach/1.0"})
+    # Use browser-like headers. Some public holdings/index pages block simple Python clients
+    # or return a landing page instead of CSV unless Accept/Referer are set.
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125 Safari/537.36 OptionCoach/1.0",
+        "Accept": "text/csv,application/csv,text/plain,text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+    if "ishares.com" in url or "blackrock.com" in url:
+        headers["Referer"] = "https://www.ishares.com/us/products/239710/ishares-russell-2000-etf"
+    resp = await client.get(url, headers=headers)
     resp.raise_for_status()
-    return resp.text
+    # Some iShares downloads include UTF-8 BOM or odd encodings; text is okay here,
+    # but normalize the BOM so the CSV header is detectable.
+    return resp.text.lstrip("\ufeff")
 
 
 def _clean_symbol(symbol: str) -> str:
@@ -836,49 +847,82 @@ def _csv_symbols(text: str, preferred_columns: List[str]) -> List[str]:
 
 
 def _ishares_holdings_symbols(text: str) -> List[str]:
-    """Parse an iShares holdings CSV/Excel-download response and return equity tickers.
+    """Parse an iShares/BlackRock ETF holdings CSV response and return equity tickers.
 
-    BlackRock/iShares holdings downloads often include disclaimer rows before the
-    actual CSV header, so this finds the row containing a Ticker column instead
-    of assuming line 1 is the header.
+    The IWM download is not a clean one-line-header CSV. It usually has several
+    metadata/disclaimer rows before the real holdings header, and sometimes extra
+    tables below it. The old parser grabbed the first weak `Ticker` row and could
+    return only a few symbols. This version scores every plausible header row and
+    keeps the parse that produces the most valid equity tickers.
     """
-    rows = list(csv.reader(io.StringIO(text)))
-    header_idx = None
-    ticker_col = None
-    asset_col = None
-    exchange_col = None
-    for i, row in enumerate(rows[:80]):
-        normalized = [str(c or '').strip().lower() for c in row]
-        if 'ticker' in normalized:
-            header_idx = i
-            ticker_col = normalized.index('ticker')
-            if 'asset class' in normalized:
-                asset_col = normalized.index('asset class')
-            if 'exchange' in normalized:
-                exchange_col = normalized.index('exchange')
-            break
-    if header_idx is None or ticker_col is None:
+    clean_text = text.lstrip("\ufeff")
+    # If BlackRock returns an HTML page, first try to locate CSV-looking text inside it.
+    if "<html" in clean_text[:1000].lower() and clean_text.lower().count("ticker") < 3:
         return []
 
-    symbols: List[str] = []
-    bad = {'-', '--', 'CASH', 'USD', 'US DOLLAR', 'XTSLA', 'N/A'}
-    for row in rows[header_idx + 1:]:
-        if ticker_col >= len(row):
+    rows = list(csv.reader(io.StringIO(clean_text)))
+    bad = {'-', '--', 'CASH', 'USD', 'US DOLLAR', 'N/A', 'NAN', 'GBP', 'EUR', 'CAD'}
+    best: List[str] = []
+
+    for i, row in enumerate(rows):
+        normalized = [str(c or '').strip().lower().replace('\ufeff', '') for c in row]
+        if 'ticker' not in normalized:
             continue
-        raw = str(row[ticker_col] or '').strip()
-        if not raw or raw.upper() in bad:
-            continue
-        asset = str(row[asset_col] or '').strip().lower() if asset_col is not None and asset_col < len(row) else ''
-        exch = str(row[exchange_col] or '').strip().lower() if exchange_col is not None and exchange_col < len(row) else ''
-        # Keep U.S. listed equities and ignore cash/futures/options/FX rows.
-        if asset and not any(term in asset for term in ['equity', 'stock']):
-            continue
-        if exch and any(term in exch for term in ['cash', 'currency', 'future']):
-            continue
-        t = _clean_symbol(raw)
-        if t:
-            symbols.append(t)
-    return _unique_symbols(symbols)
+        ticker_col = normalized.index('ticker')
+        asset_col = normalized.index('asset class') if 'asset class' in normalized else None
+        exchange_col = normalized.index('exchange') if 'exchange' in normalized else None
+        name_col = normalized.index('name') if 'name' in normalized else None
+
+        symbols: List[str] = []
+        for data_row in rows[i + 1:]:
+            if ticker_col >= len(data_row):
+                continue
+            raw = str(data_row[ticker_col] or '').strip().strip('"')
+            if not raw:
+                continue
+            upper = raw.upper()
+            if upper in bad or upper.startswith('CASH'):
+                continue
+            # Stop if we clearly moved into footer/legal text.
+            first_cell = str(data_row[0] if data_row else '').strip().lower()
+            if first_cell.startswith(('holdings are subject', 'the information', '©', 'copyright', 'all other marks')):
+                break
+            asset = str(data_row[asset_col] or '').strip().lower() if asset_col is not None and asset_col < len(data_row) else ''
+            exch = str(data_row[exchange_col] or '').strip().lower() if exchange_col is not None and exchange_col < len(data_row) else ''
+            name = str(data_row[name_col] or '').strip().lower() if name_col is not None and name_col < len(data_row) else ''
+            # Keep listed equities/common stocks. Do not throw out rows when the
+            # asset column is missing, but do filter obvious non-equity instruments.
+            non_equity_blob = ' '.join([asset, exch, name])
+            if any(term in non_equity_blob for term in ['cash collateral', 'money market', 'treasury bill', 'future', 'swap', 'currency']):
+                continue
+            if asset and not any(term in asset for term in ['equity', 'stock']):
+                continue
+            t = _clean_symbol(raw)
+            if t:
+                symbols.append(t)
+
+        symbols = _unique_symbols(symbols)
+        if len(symbols) > len(best):
+            best = symbols
+
+    # Fallback for CSV-like text where ticker appears as quoted first/second field but header detection failed.
+    if len(best) < 1500:
+        rough: List[str] = []
+        for line in clean_text.splitlines():
+            if not line or ',' not in line:
+                continue
+            parts = next(csv.reader([line]))
+            for idx in [0, 1]:
+                if idx < len(parts):
+                    t = _clean_symbol(parts[idx])
+                    if t and t not in bad:
+                        rough.append(t)
+                        break
+        rough = _unique_symbols(rough)
+        if len(rough) > len(best):
+            best = rough
+
+    return best
 
 
 def _try_extract_js_json_symbols(text: str, key_names: List[str]) -> List[str]:
@@ -951,8 +995,13 @@ async def fetch_live_constituents(include_russell2000: bool = True) -> Dict[str,
         "sp500": "https://raw.githubusercontent.com/datasets/s-and-p-500-companies/main/data/constituents.csv",
         "nasdaq100": "https://en.wikipedia.org/wiki/Nasdaq-100",
         "dow30": "https://en.wikipedia.org/wiki/Dow_Jones_Industrial_Average",
-        "russell2000_primary": "https://www.ishares.com/us/products/239710/ishares-russell-2000-etf/1467271812596.ajax?fileType=csv&fileName=IWM_holdings&dataType=fund",
-        "russell2000_alt": "https://www.blackrock.com/us/individual/products/239710/ishares-russell-2000-etf/1467271812596.ajax?fileType=csv&fileName=IWM_holdings&dataType=fund",
+        # Try several BlackRock/iShares CSV download URL variants. Some environments
+        # return a short landing/metadata payload for one variant but a full holdings
+        # CSV for another.
+        "russell2000_primary": "https://www.ishares.com/us/products/239710/ishares-russell-2000-etf?fileType=csv&fileName=IWM_holdings&dataType=fund",
+        "russell2000_alt": "https://www.ishares.com/us/products/239710/ishares-russell-2000-etf/1467271812596.ajax?fileType=csv&fileName=IWM_holdings&dataType=fund",
+        "russell2000_blackrock": "https://www.blackrock.com/us/individual/products/239710/ishares-russell-2000-etf?fileType=csv&fileName=IWM_holdings&dataType=fund",
+        "russell2000_blackrock_ajax": "https://www.blackrock.com/us/individual/products/239710/ishares-russell-2000-etf/1467271812596.ajax?fileType=csv&fileName=IWM_holdings&dataType=fund",
     }
     current = {k: list(v) for k, v in INDEX_MAP.items()}
     results: Dict[str, Any] = {}
@@ -998,7 +1047,7 @@ async def fetch_live_constituents(include_russell2000: bool = True) -> Dict[str,
         # Russell 2000 via IWM holdings. This is a practical complete-tradable universe, not a tiny watchlist.
         if include_russell2000:
             russell_result = None
-            for label in ["russell2000_primary", "russell2000_alt"]:
+            for label in ["russell2000_primary", "russell2000_alt", "russell2000_blackrock", "russell2000_blackrock_ajax"]:
                 try:
                     text = await _fetch_text(client, sources[label])
                     r2k = _ishares_holdings_symbols(text)
@@ -4880,7 +4929,7 @@ async def premarket_recommendations(req: PremarketRecommendationRequest) -> Dict
             "errors": (cache.get("errors") or [])[:5],
         },
         "methodology": {
-            "version": "premarket_recommendations_benzinga_v2_10",
+            "version": "premarket_recommendations_benzinga_v2_11",
             "purpose": "Compact premarket recommendations using Polygon technicals plus Benzinga catalysts, options flow, analyst actions, and risk events.",
             "benzinga_sources": [
                 "news", "wiim", "newsquantified", "unusual_options", "market_movers",
