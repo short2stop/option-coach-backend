@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import csv
+import html
+import io
 import json
 import os
 import re
@@ -19,13 +22,13 @@ import httpx
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
-app = FastAPI(title="Option Coach Backend - Signals v2")
+app = FastAPI(title="Option Coach Backend - Signals v2.10")
 
 POLYGON_API_KEY = os.getenv("POLYGON_API_KEY", "").strip()
 BENZINGA_API_KEY = os.getenv("BENZINGA_API_KEY", "").strip()
 POLYGON_BASE = "https://api.polygon.io/v2"
 BENZINGA_BASE = "https://api.benzinga.com"
-CONSTITUENTS_FILE = Path(__file__).with_name("constituents.json")
+CONSTITUENTS_FILE = Path(os.getenv("OPTION_COACH_CONSTITUENTS_FILE", str(Path(__file__).with_name("constituents.json"))))
 
 ALL_UNIVERSES = ["sp500", "dow30", "nasdaq100", "russell2000", "crypto", "watchlist"]
 CACHE_MAX_AGE_SECONDS = int(os.getenv("OPTION_COACH_CACHE_SECONDS", str(60 * 60 * 12)))
@@ -56,6 +59,21 @@ CACHE: Dict[str, Any] = {
 CACHE_LOCK = asyncio.Lock()
 
 
+def normalize_constituents(raw: Dict[str, Any]) -> Dict[str, List[str]]:
+    cleaned: Dict[str, List[str]] = {}
+    for universe, tickers in (raw or {}).items():
+        if isinstance(tickers, list):
+            seen = set()
+            vals: List[str] = []
+            for item in tickers:
+                t = str(item).strip().upper()
+                if t and t not in seen:
+                    seen.add(t)
+                    vals.append(t)
+            cleaned[str(universe).strip().lower()] = vals
+    return cleaned
+
+
 def load_constituents() -> Dict[str, List[str]]:
     if not CONSTITUENTS_FILE.exists():
         return {}
@@ -64,12 +82,11 @@ def load_constituents() -> Dict[str, List[str]]:
             raw = json.load(f)
     except Exception:
         return {}
+    return normalize_constituents(raw)
 
-    cleaned: Dict[str, List[str]] = {}
-    for universe, tickers in raw.items():
-        if isinstance(tickers, list):
-            cleaned[universe] = [str(t).strip().upper() for t in tickers if str(t).strip()]
-    return cleaned
+
+def save_constituents(index_map: Dict[str, List[str]]) -> None:
+    CONSTITUENTS_FILE.write_text(json.dumps(index_map, indent=2, sort_keys=True), encoding="utf-8")
 
 
 INDEX_MAP = load_constituents()
@@ -770,6 +787,247 @@ def build_universe_response(req: ScreenRequest, universe: str) -> Dict[str, Any]
     }
 
 
+
+class WatchlistUpdateRequest(BaseModel):
+    add: Optional[List[str]] = Field(default=None, description="Tickers to add to watchlist")
+    remove: Optional[List[str]] = Field(default=None, description="Tickers to remove from watchlist")
+    set: Optional[List[str]] = Field(default=None, description="Replace watchlist with this exact ticker list")
+    persist: bool = Field(default=True, description="Write changes back to constituents.json")
+
+
+async def _fetch_text(client: httpx.AsyncClient, url: str) -> str:
+    resp = await client.get(url, headers={"User-Agent": "OptionCoach/1.0"})
+    resp.raise_for_status()
+    return resp.text
+
+
+def _clean_symbol(symbol: str) -> str:
+    t = html.unescape(str(symbol or "")).strip().upper()
+    t = re.sub(r"\s+", "", t)
+    t = t.replace("/", ".")
+    # Keep common equity ticker formats such as BRK.B and BF.B.
+    if not re.fullmatch(r"[A-Z][A-Z0-9]{0,5}(?:\.[A-Z])?", t):
+        return ""
+    return t
+
+
+def _unique_symbols(symbols: List[str]) -> List[str]:
+    seen = set()
+    out: List[str] = []
+    for s in symbols:
+        t = _clean_symbol(s)
+        if t and t not in seen:
+            seen.add(t)
+            out.append(t)
+    return out
+
+
+def _csv_symbols(text: str, preferred_columns: List[str]) -> List[str]:
+    reader = csv.DictReader(io.StringIO(text))
+    out: List[str] = []
+    for row in reader:
+        for col in preferred_columns:
+            if col in row and row[col]:
+                out.append(row[col])
+                break
+    return _unique_symbols(out)
+
+
+
+
+def _ishares_holdings_symbols(text: str) -> List[str]:
+    """Parse an iShares holdings CSV/Excel-download response and return equity tickers.
+
+    BlackRock/iShares holdings downloads often include disclaimer rows before the
+    actual CSV header, so this finds the row containing a Ticker column instead
+    of assuming line 1 is the header.
+    """
+    rows = list(csv.reader(io.StringIO(text)))
+    header_idx = None
+    ticker_col = None
+    asset_col = None
+    exchange_col = None
+    for i, row in enumerate(rows[:80]):
+        normalized = [str(c or '').strip().lower() for c in row]
+        if 'ticker' in normalized:
+            header_idx = i
+            ticker_col = normalized.index('ticker')
+            if 'asset class' in normalized:
+                asset_col = normalized.index('asset class')
+            if 'exchange' in normalized:
+                exchange_col = normalized.index('exchange')
+            break
+    if header_idx is None or ticker_col is None:
+        return []
+
+    symbols: List[str] = []
+    bad = {'-', '--', 'CASH', 'USD', 'US DOLLAR', 'XTSLA', 'N/A'}
+    for row in rows[header_idx + 1:]:
+        if ticker_col >= len(row):
+            continue
+        raw = str(row[ticker_col] or '').strip()
+        if not raw or raw.upper() in bad:
+            continue
+        asset = str(row[asset_col] or '').strip().lower() if asset_col is not None and asset_col < len(row) else ''
+        exch = str(row[exchange_col] or '').strip().lower() if exchange_col is not None and exchange_col < len(row) else ''
+        # Keep U.S. listed equities and ignore cash/futures/options/FX rows.
+        if asset and not any(term in asset for term in ['equity', 'stock']):
+            continue
+        if exch and any(term in exch for term in ['cash', 'currency', 'future']):
+            continue
+        t = _clean_symbol(raw)
+        if t:
+            symbols.append(t)
+    return _unique_symbols(symbols)
+
+
+def _try_extract_js_json_symbols(text: str, key_names: List[str]) -> List[str]:
+    # Lightweight fallback for pages that embed holdings data in JSON-ish script tags.
+    symbols: List[str] = []
+    for key in key_names:
+        pattern = rf'"{re.escape(key)}"\s*:\s*"([A-Za-z][A-Za-z0-9\.\-]{{0,7}})"'
+        symbols.extend(re.findall(pattern, text))
+    return _unique_symbols(symbols)
+
+def _wiki_first_table_after(html_text: str, section_ids: List[str]) -> str:
+    lower = html_text.lower()
+    start = 0
+    for sid in section_ids:
+        idx = lower.find(f'id="{sid.lower()}"')
+        if idx >= 0:
+            start = idx
+            break
+    table_start = lower.find("<table", start)
+    if table_start < 0:
+        table_start = lower.find("<table")
+    table_end = lower.find("</table>", table_start)
+    if table_start < 0 or table_end < 0:
+        return ""
+    return html_text[table_start:table_end]
+
+
+def _wiki_table_symbols(html_text: str, section_ids: List[str], expected_min: int = 1) -> List[str]:
+    table = _wiki_first_table_after(html_text, section_ids)
+    if not table:
+        return []
+    rows = re.findall(r"<tr[^>]*>.*?</tr>", table, flags=re.I | re.S)
+    symbols: List[str] = []
+    for row in rows:
+        # Prefer external exchange ticker links inside the row.
+        exchange_links = re.findall(
+            r'<a[^>]+href="[^"]*(?:nasdaq\.com|nyse\.com)[^"]*"[^>]*>(.*?)</a>',
+            row,
+            flags=re.I | re.S,
+        )
+        for raw in exchange_links:
+            text = re.sub(r"<.*?>", "", raw)
+            t = _clean_symbol(text)
+            if t:
+                symbols.append(t)
+        if exchange_links:
+            continue
+        # Fallback: first cell text often contains the ticker.
+        cells = re.findall(r"<td[^>]*>(.*?)</td>", row, flags=re.I | re.S)
+        if cells:
+            text = re.sub(r"<.*?>", "", cells[0])
+            t = _clean_symbol(text)
+            if t:
+                symbols.append(t)
+    out = _unique_symbols(symbols)
+    if len(out) < expected_min:
+        return []
+    return out
+
+
+async def fetch_live_constituents(include_russell2000: bool = True) -> Dict[str, Any]:
+    """Fetch current broad universe membership from public sources.
+
+    This keeps constituents.json as a fallback, while allowing the backend to refresh stale index lists.
+    Russell 2000 is refreshed from the iShares IWM holdings download as a practical proxy for
+    Russell 2000 constituents. IWM seeks to track the Russell 2000 Index and publishes ~1,900
+    holdings, which is close enough for this scanner and much better than a hand-maintained 10-name list.
+    """
+    sources = {
+        "sp500": "https://raw.githubusercontent.com/datasets/s-and-p-500-companies/main/data/constituents.csv",
+        "nasdaq100": "https://en.wikipedia.org/wiki/Nasdaq-100",
+        "dow30": "https://en.wikipedia.org/wiki/Dow_Jones_Industrial_Average",
+        "russell2000_primary": "https://www.ishares.com/us/products/239710/ishares-russell-2000-etf/1467271812596.ajax?fileType=csv&fileName=IWM_holdings&dataType=fund",
+        "russell2000_alt": "https://www.blackrock.com/us/individual/products/239710/ishares-russell-2000-etf/1467271812596.ajax?fileType=csv&fileName=IWM_holdings&dataType=fund",
+    }
+    current = {k: list(v) for k, v in INDEX_MAP.items()}
+    results: Dict[str, Any] = {}
+    errors: List[str] = []
+    timeout = httpx.Timeout(connect=10.0, read=45.0, write=10.0, pool=45.0)
+    async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+        # S&P 500 via CSV. This public dataset usually tracks the Wikipedia S&P constituent table.
+        try:
+            text = await _fetch_text(client, sources["sp500"])
+            sp500 = _csv_symbols(text, ["Symbol", "Ticker", "ticker", "symbol"])
+            if len(sp500) >= 450:
+                current["sp500"] = sp500
+                results["sp500"] = {"count": len(sp500), "source": sources["sp500"], "status": "updated"}
+            else:
+                results["sp500"] = {"count": len(sp500), "source": sources["sp500"], "status": "ignored_low_count"}
+        except Exception as e:
+            errors.append(f"sp500 refresh failed: {type(e).__name__}: {e}")
+
+        # Nasdaq-100 via Wikipedia current components table.
+        try:
+            text = await _fetch_text(client, sources["nasdaq100"])
+            ndx = _wiki_table_symbols(text, ["current_components", "components"], expected_min=90)
+            if len(ndx) >= 90:
+                current["nasdaq100"] = ndx
+                results["nasdaq100"] = {"count": len(ndx), "source": sources["nasdaq100"], "status": "updated"}
+            else:
+                results["nasdaq100"] = {"count": len(ndx), "source": sources["nasdaq100"], "status": "ignored_low_count"}
+        except Exception as e:
+            errors.append(f"nasdaq100 refresh failed: {type(e).__name__}: {e}")
+
+        # Dow 30 via Wikipedia components table.
+        try:
+            text = await _fetch_text(client, sources["dow30"])
+            dow = _wiki_table_symbols(text, ["components"], expected_min=25)
+            if len(dow) >= 25:
+                current["dow30"] = dow[:30]
+                results["dow30"] = {"count": len(dow[:30]), "source": sources["dow30"], "status": "updated"}
+            else:
+                results["dow30"] = {"count": len(dow), "source": sources["dow30"], "status": "ignored_low_count"}
+        except Exception as e:
+            errors.append(f"dow30 refresh failed: {type(e).__name__}: {e}")
+
+        # Russell 2000 via IWM holdings. This is a practical complete-tradable universe, not a tiny watchlist.
+        if include_russell2000:
+            russell_result = None
+            for label in ["russell2000_primary", "russell2000_alt"]:
+                try:
+                    text = await _fetch_text(client, sources[label])
+                    r2k = _ishares_holdings_symbols(text)
+                    if len(r2k) < 1500:
+                        # If the CSV parser did not catch the download format, try embedded page text fallback.
+                        r2k = _try_extract_js_json_symbols(text, ["ticker", "localExchangeTicker"])
+                    if len(r2k) >= 1500:
+                        current["russell2000"] = r2k
+                        russell_result = {"count": len(r2k), "source": sources[label], "status": "updated", "proxy": "IWM_holdings"}
+                        break
+                    russell_result = {"count": len(r2k), "source": sources[label], "status": "ignored_low_count", "proxy": "IWM_holdings"}
+                except Exception as e:
+                    errors.append(f"russell2000 refresh failed from {label}: {type(e).__name__}: {e}")
+            if russell_result:
+                results["russell2000"] = russell_result
+
+    # Preserve custom universes from local file. Russell 2000 is preserved only if refresh failed/was disabled.
+    for custom in ["watchlist", "crypto"]:
+        current.setdefault(custom, INDEX_MAP.get(custom, []))
+    current.setdefault("russell2000", INDEX_MAP.get("russell2000", []))
+
+    normalized = normalize_constituents(current)
+    return {
+        "index_map": normalized,
+        "results": results,
+        "errors": errors,
+        "counts": {k: len(v) for k, v in sorted(normalized.items())},
+    }
+
 # -------------------------
 # Benzinga capability test layer
 # -------------------------
@@ -1315,6 +1573,81 @@ def health() -> Dict[str, Any]:
         "email_configured": bool(EMAIL_ADDRESS and EMAIL_PASSWORD and EMAIL_RECIPIENT),
         "tracking_file": str(TRACKED_SIGNALS_FILE),
         "tracking_records": len(load_tracked_signals()) if TRACKED_SIGNALS_FILE.exists() else 0,
+    }
+
+
+@app.get("/universe_members")
+def universe_members(universe: str = "all") -> Dict[str, Any]:
+    u = str(universe or "all").strip().lower()
+    if u == "all":
+        return {
+            "source_file": str(CONSTITUENTS_FILE),
+            "universes": {name: {"count": len(tickers), "tickers": tickers} for name, tickers in sorted(INDEX_MAP.items())},
+            "counts": {name: len(tickers) for name, tickers in sorted(INDEX_MAP.items())},
+        }
+    if u not in INDEX_MAP:
+        raise HTTPException(status_code=404, detail=f"Unknown universe: {universe}")
+    return {"universe": u, "count": len(INDEX_MAP.get(u, [])), "tickers": INDEX_MAP.get(u, [])}
+
+
+@app.post("/reload_constituents")
+def reload_constituents() -> Dict[str, Any]:
+    global INDEX_MAP
+    INDEX_MAP = load_constituents()
+    if not INDEX_MAP:
+        raise HTTPException(status_code=500, detail=f"No constituents loaded from {CONSTITUENTS_FILE}")
+    return {
+        "reloaded": True,
+        "source_file": str(CONSTITUENTS_FILE),
+        "counts": {name: len(tickers) for name, tickers in sorted(INDEX_MAP.items())},
+        "universes_loaded": sorted(INDEX_MAP.keys()),
+    }
+
+
+@app.post("/refresh_constituents")
+async def refresh_constituents(persist: bool = True, include_russell2000: bool = True) -> Dict[str, Any]:
+    global INDEX_MAP
+    refreshed = await fetch_live_constituents(include_russell2000=include_russell2000)
+    INDEX_MAP = refreshed["index_map"]
+    if persist:
+        try:
+            save_constituents(INDEX_MAP)
+        except Exception as e:
+            refreshed.setdefault("errors", []).append(f"persist failed: {type(e).__name__}: {e}")
+    return {
+        "refreshed": True,
+        "persisted": bool(persist),
+        "include_russell2000": bool(include_russell2000),
+        "source_file": str(CONSTITUENTS_FILE),
+        "results": refreshed.get("results"),
+        "errors": refreshed.get("errors"),
+        "counts": refreshed.get("counts"),
+        "universes_loaded": sorted(INDEX_MAP.keys()),
+    }
+
+
+@app.post("/update_watchlist")
+def update_watchlist(req: WatchlistUpdateRequest) -> Dict[str, Any]:
+    global INDEX_MAP
+    current = list(INDEX_MAP.get("watchlist", []))
+    if req.set is not None:
+        current = _unique_symbols(req.set)
+    else:
+        remove = set(_unique_symbols(req.remove or []))
+        add = _unique_symbols(req.add or [])
+        current = [t for t in current if t not in remove]
+        for t in add:
+            if t not in current:
+                current.append(t)
+    INDEX_MAP["watchlist"] = current
+    if req.persist:
+        save_constituents(INDEX_MAP)
+    return {
+        "updated": True,
+        "persisted": bool(req.persist),
+        "universe": "watchlist",
+        "count": len(current),
+        "tickers": current,
     }
 
 
@@ -4547,7 +4880,7 @@ async def premarket_recommendations(req: PremarketRecommendationRequest) -> Dict
             "errors": (cache.get("errors") or [])[:5],
         },
         "methodology": {
-            "version": "premarket_recommendations_benzinga_v2_7",
+            "version": "premarket_recommendations_benzinga_v2_10",
             "purpose": "Compact premarket recommendations using Polygon technicals plus Benzinga catalysts, options flow, analyst actions, and risk events.",
             "benzinga_sources": [
                 "news", "wiim", "newsquantified", "unusual_options", "market_movers",
@@ -5106,7 +5439,7 @@ async def intraday_recommendations(req: IntradayRecommendationRequest) -> Dict[s
             "errors": (cache.get("errors") or [])[:5],
         },
         "methodology": {
-            "version": "intraday_recommendations_benzinga_v1",
+            "version": "intraday_recommendations_benzinga_v2_10",
             "purpose": "Open-market intraday recommendations using live Polygon snapshots, premarket context, and Benzinga catalysts/options/risk events.",
             "cadence": "Run 1-5 minutes after the open and refresh every few minutes. Use refresh=true on the first call, then refresh=false for follow-ups unless the cache looks stale.",
             "inputs": [
