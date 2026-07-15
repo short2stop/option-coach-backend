@@ -33,6 +33,12 @@ CONSTITUENTS_FILE = Path(os.getenv("OPTION_COACH_CONSTITUENTS_FILE", str(Path(__
 ALL_UNIVERSES = ["sp500", "dow30", "nasdaq100", "russell2000", "crypto", "watchlist"]
 CACHE_MAX_AGE_SECONDS = int(os.getenv("OPTION_COACH_CACHE_SECONDS", str(60 * 60 * 12)))
 
+# Live-price validation settings. Historical/grouped cache remains separate.
+LIVE_QUOTE_REGULAR_MAX_AGE_SECONDS = int(os.getenv("LIVE_QUOTE_REGULAR_MAX_AGE_SECONDS", "20"))
+LIVE_QUOTE_EXTENDED_MAX_AGE_SECONDS = int(os.getenv("LIVE_QUOTE_EXTENDED_MAX_AGE_SECONDS", "90"))
+LIVE_QUOTE_MAX_SPREAD_PCT = float(os.getenv("LIVE_QUOTE_MAX_SPREAD_PCT", "1.50"))
+LIVE_QUOTE_TIMEOUT_SECONDS = float(os.getenv("LIVE_QUOTE_TIMEOUT_SECONDS", "8"))
+
 DATA_DIR = Path(os.getenv("OPTION_COACH_DATA_DIR", "/var/data"))
 TRACKED_SIGNALS_FILE = DATA_DIR / "tracked_signals.json"
 TRACKING_MAX_DAYS = int(os.getenv("OPTION_COACH_TRACKING_MAX_DAYS", "7"))
@@ -401,72 +407,163 @@ async def fetch_polygon_crypto_one(client: httpx.AsyncClient, symbol: str) -> Di
 
 
 
+def _polygon_timestamp_to_datetime(value: Any) -> Optional[datetime]:
+    """Convert Polygon timestamps supplied as ns, us, ms, or seconds into UTC."""
+    try:
+        raw = float(value)
+        if raw <= 0:
+            return None
+        if raw > 1e17:
+            seconds = raw / 1_000_000_000
+        elif raw > 1e14:
+            seconds = raw / 1_000_000
+        elif raw > 1e11:
+            seconds = raw / 1_000
+        else:
+            seconds = raw
+        return datetime.fromtimestamp(seconds, tz=timezone.utc)
+    except Exception:
+        return None
+
+
+def _quote_age_seconds(timestamp: Optional[datetime]) -> Optional[float]:
+    if timestamp is None:
+        return None
+    return max(0.0, (datetime.now(timezone.utc) - timestamp).total_seconds())
+
+
+def _live_quote_max_age_seconds() -> int:
+    phase = market_session_phase()
+    if phase == "regular_market":
+        return LIVE_QUOTE_REGULAR_MAX_AGE_SECONDS
+    if phase in {"premarket", "after_hours"}:
+        return LIVE_QUOTE_EXTENDED_MAX_AGE_SECONDS
+    return 60 * 60 * 24
+
+
 async def fetch_intraday_snapshot(
     client: httpx.AsyncClient,
     ticker: str,
 ) -> Dict[str, Any]:
+    """Fetch and validate current price without treating snapshot day.c as live."""
+    ticker = normalize_ticker(ticker)
     if not POLYGON_API_KEY:
-        return {"ticker": ticker, "error": "Polygon API key missing"}
+        return {"ticker": ticker, "error": "Polygon API key missing", "price_verified": False}
 
-    url = f"https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/tickers/{ticker}"
+    snapshot_url = f"https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/tickers/{ticker}"
+    trade_url = f"https://api.polygon.io/v2/last/trade/{ticker}"
+    quote_url = f"https://api.polygon.io/v2/last/nbbo/{ticker}"
     params = {"apiKey": POLYGON_API_KEY}
 
     try:
-        resp = await client.get(url, params=params)
-        if resp.status_code != 200:
-            return {"ticker": ticker, "error": f"Snapshot HTTP {resp.status_code}: {resp.text[:200]}"}
+        snapshot_resp, trade_resp, quote_resp = await asyncio.gather(
+            client.get(snapshot_url, params=params),
+            client.get(trade_url, params=params),
+            client.get(quote_url, params=params),
+            return_exceptions=True,
+        )
 
-        data = resp.json()
-        ticker_data = data.get("ticker", {})
-        day = ticker_data.get("day", {}) or {}
-        minute = ticker_data.get("min", {}) or {}
-        prev_day = ticker_data.get("prevDay", {}) or {}
-        last_trade = ticker_data.get("lastTrade", {}) or {}
+        if isinstance(snapshot_resp, Exception):
+            return {"ticker": ticker, "error": f"Snapshot request failed: {snapshot_resp}", "price_verified": False}
+        if snapshot_resp.status_code != 200:
+            return {"ticker": ticker, "error": f"Snapshot HTTP {snapshot_resp.status_code}: {snapshot_resp.text[:200]}", "price_verified": False}
+
+        snapshot_data = snapshot_resp.json().get("ticker", {}) or {}
+        day = snapshot_data.get("day", {}) or {}
+        minute = snapshot_data.get("min", {}) or {}
+        prev_day = snapshot_data.get("prevDay", {}) or {}
+        snapshot_trade = snapshot_data.get("lastTrade", {}) or {}
+        snapshot_quote = snapshot_data.get("lastQuote", {}) or {}
+
+        direct_trade = {}
+        if not isinstance(trade_resp, Exception) and trade_resp.status_code == 200:
+            direct_trade = trade_resp.json().get("results", {}) or {}
+
+        direct_quote = {}
+        if not isinstance(quote_resp, Exception) and quote_resp.status_code == 200:
+            direct_quote = quote_resp.json().get("results", {}) or {}
+
+        candidates = []
+        direct_trade_price = safe_float(direct_trade.get("p"))
+        direct_trade_ts = _polygon_timestamp_to_datetime(direct_trade.get("t") or direct_trade.get("sip_timestamp"))
+        if direct_trade_price > 0:
+            candidates.append({"price": direct_trade_price, "timestamp": direct_trade_ts, "source": "polygon_last_trade"})
+
+        snapshot_trade_price = safe_float(snapshot_trade.get("p"))
+        snapshot_trade_ts = _polygon_timestamp_to_datetime(snapshot_trade.get("t") or snapshot_trade.get("sip_timestamp"))
+        if snapshot_trade_price > 0:
+            candidates.append({"price": snapshot_trade_price, "timestamp": snapshot_trade_ts, "source": "polygon_snapshot_last_trade"})
+
+        minute_price = safe_float(minute.get("c"))
+        minute_ts = _polygon_timestamp_to_datetime(minute.get("t"))
+        if minute_price > 0:
+            candidates.append({"price": minute_price, "timestamp": minute_ts, "source": "polygon_snapshot_minute_close"})
+
+        timestamped = [c for c in candidates if c.get("timestamp") is not None]
+        selected = max(timestamped, key=lambda c: c["timestamp"]) if timestamped else (candidates[0] if candidates else None)
+
+        bid = safe_float(direct_quote.get("p")) or safe_float(direct_quote.get("bid_price")) or safe_float(snapshot_quote.get("p"))
+        ask = safe_float(direct_quote.get("P")) or safe_float(direct_quote.get("ask_price")) or safe_float(snapshot_quote.get("P"))
+        quote_ts = _polygon_timestamp_to_datetime(direct_quote.get("t") or direct_quote.get("sip_timestamp") or snapshot_quote.get("t"))
+        midpoint = (bid + ask) / 2 if bid > 0 and ask > 0 and ask >= bid else 0.0
+
+        if selected:
+            current_price = safe_float(selected["price"])
+            price_timestamp = selected.get("timestamp")
+            price_source = selected.get("source")
+        elif midpoint > 0:
+            current_price = midpoint
+            price_timestamp = quote_ts
+            price_source = "polygon_nbbo_midpoint"
+        else:
+            return {
+                "ticker": ticker,
+                "error": "No valid last trade, minute close, or NBBO midpoint returned",
+                "price_verified": False,
+                "snapshot_status": snapshot_resp.status_code,
+                "last_trade_status": None if isinstance(trade_resp, Exception) else trade_resp.status_code,
+                "last_quote_status": None if isinstance(quote_resp, Exception) else quote_resp.status_code,
+            }
 
         prev_close = safe_float(prev_day.get("c"))
-        todays_change = safe_float(ticker_data.get("todaysChange"))
-        intraday_change_pct = safe_float(ticker_data.get("todaysChangePerc"))
-
-        # Polygon snapshots sometimes return today's percent change while day.c/o/h/l/vw
-        # are still zero/empty. Fall back aggressively so live entries do not become stale.
-        current_price = (
-            safe_float(day.get("c"))
-            or safe_float(minute.get("c"))
-            or safe_float(last_trade.get("p"))
-        )
-
-        if current_price <= 0 and prev_close > 0 and todays_change != 0:
-            current_price = prev_close + todays_change
-
-        if current_price <= 0 and prev_close > 0 and intraday_change_pct != 0:
-            current_price = prev_close * (1 + intraday_change_pct / 100)
-
         open_price = safe_float(day.get("o")) or safe_float(minute.get("o")) or prev_close or current_price
-        high_price = safe_float(day.get("h")) or safe_float(minute.get("h")) or max(open_price, current_price)
-        low_price = safe_float(day.get("l")) or safe_float(minute.get("l")) or min(open_price, current_price)
-
-        volume = (
-            safe_float(day.get("v"))
-            or safe_float(minute.get("av"))
-            or safe_float(minute.get("v"))
-        )
-
+        high_price = max(safe_float(day.get("h")), safe_float(minute.get("h")), current_price, open_price)
+        lows = [x for x in [safe_float(day.get("l")), safe_float(minute.get("l")), current_price, open_price] if x > 0]
+        low_price = min(lows) if lows else current_price
+        volume = safe_float(day.get("v")) or safe_float(minute.get("av")) or safe_float(minute.get("v"))
         day_vwap = safe_float(day.get("vw")) or safe_float(minute.get("vw")) or current_price
 
-        if intraday_change_pct == 0 and prev_close > 0 and current_price > 0:
-            intraday_change_pct = ((current_price - prev_close) / prev_close) * 100
+        intraday_change_pct = ((current_price - prev_close) / prev_close) * 100 if prev_close > 0 else 0.0
+        distance_from_high_pct = ((current_price - high_price) / high_price) * 100 if high_price > 0 else 0.0
 
-        distance_from_high_pct = 0.0
-        if high_price > 0 and current_price > 0:
-            distance_from_high_pct = ((current_price - high_price) / high_price) * 100
+        quote_age = _quote_age_seconds(price_timestamp)
+        max_age = _live_quote_max_age_seconds()
+        spread_pct = ((ask - bid) / midpoint) * 100 if midpoint > 0 and ask >= bid else None
+        phase = market_session_phase()
 
-        above_open = bool(current_price and open_price and current_price >= open_price)
-        above_vwap = bool(current_price and day_vwap and current_price >= day_vwap)
-        intraday_confirmed = intraday_change_pct > 0 and above_open and distance_from_high_pct > -2.0
+        verification_reasons = []
+        if price_timestamp is None:
+            verification_reasons.append("Price timestamp missing")
+        elif quote_age is not None and quote_age > max_age:
+            verification_reasons.append(f"Price is stale: {quote_age:.1f}s old, maximum {max_age}s for {phase}")
+        if spread_pct is not None and spread_pct > LIVE_QUOTE_MAX_SPREAD_PCT:
+            verification_reasons.append(f"NBBO spread is wide: {spread_pct:.2f}%")
 
-        if intraday_confirmed:
+        midpoint_diff_pct = abs(current_price - midpoint) / midpoint * 100 if midpoint > 0 else None
+        if midpoint_diff_pct is not None and midpoint_diff_pct > max(LIVE_QUOTE_MAX_SPREAD_PCT, 1.0):
+            verification_reasons.append(f"Trade/NBBO mismatch: {midpoint_diff_pct:.2f}%")
+
+        price_verified = not verification_reasons
+        above_open = current_price >= open_price if open_price > 0 else False
+        above_vwap = current_price >= day_vwap if day_vwap > 0 else False
+        intraday_confirmed = price_verified and intraday_change_pct > 0 and above_open and distance_from_high_pct > -2.0
+
+        if not price_verified:
+            entry_status = "price_unverified"
+            reason = "; ".join(verification_reasons)
+        elif intraday_confirmed:
             entry_status = "active_candidate"
-            reason = "Bullish intraday confirmation passed"
+            reason = "Bullish intraday confirmation passed using verified live price"
         elif intraday_change_pct <= -1.0:
             entry_status = "exclude_from_aggressive_calls"
             reason = "Stock is down more than 1% intraday; do not chase bullish calls"
@@ -476,13 +573,28 @@ async def fetch_intraday_snapshot(
 
         return {
             "ticker": ticker,
-            "current_price": round(current_price, 2),
-            "open": round(open_price, 2),
-            "high": round(high_price, 2),
-            "low": round(low_price, 2),
+            "current_price": round(current_price, 4),
+            "price_verified": price_verified,
+            "price_source": price_source,
+            "price_timestamp_utc": price_timestamp.isoformat() if price_timestamp else None,
+            "quote_age_seconds": round(quote_age, 1) if quote_age is not None else None,
+            "max_allowed_quote_age_seconds": max_age,
+            "market_session_phase": phase,
+            "bid": round(bid, 4) if bid > 0 else None,
+            "ask": round(ask, 4) if ask > 0 else None,
+            "nbbo_midpoint": round(midpoint, 4) if midpoint > 0 else None,
+            "spread_pct": round(spread_pct, 4) if spread_pct is not None else None,
+            "trade_vs_midpoint_diff_pct": round(midpoint_diff_pct, 4) if midpoint_diff_pct is not None else None,
+            "snapshot_day_close": round(safe_float(day.get("c")), 4) or None,
+            "snapshot_minute_close": round(minute_price, 4) if minute_price > 0 else None,
+            "snapshot_last_trade": round(snapshot_trade_price, 4) if snapshot_trade_price > 0 else None,
+            "direct_last_trade": round(direct_trade_price, 4) if direct_trade_price > 0 else None,
+            "open": round(open_price, 4),
+            "high": round(high_price, 4),
+            "low": round(low_price, 4),
             "volume": round(volume, 0),
-            "day_vwap": round(day_vwap, 2),
-            "prev_close": round(prev_close, 2),
+            "day_vwap": round(day_vwap, 4),
+            "prev_close": round(prev_close, 4),
             "intraday_change_pct": round(intraday_change_pct, 2),
             "distance_from_high_pct": round(distance_from_high_pct, 2),
             "above_open": above_open,
@@ -490,9 +602,10 @@ async def fetch_intraday_snapshot(
             "intraday_confirmed": intraday_confirmed,
             "entry_status": entry_status,
             "reason": reason,
+            "cache_status": "not_cached_live_request",
         }
     except Exception as e:
-        return {"ticker": ticker, "error": str(e)}
+        return {"ticker": ticker, "error": f"Live quote validation failed: {e}", "price_verified": False, "entry_status": "price_unverified"}
 
 
 async def fetch_intraday_snapshots_for_tickers(
@@ -585,10 +698,20 @@ def recalculate_trade_plan_from_live_price(signal: Dict[str, Any], intraday: Dic
     old_entry = safe_float(trade.get("entry"))
     live_price = safe_float(intraday.get("current_price"))
 
-    if live_price <= 0:
+    if live_price <= 0 or intraday.get("price_verified") is not True:
         signal["live_price_used_for_trade_plan"] = False
         signal["stale_entry_warning"] = True
-        signal["stale_entry_reason"] = "No valid live current_price was available; trade_plan still uses historical close."
+        signal["price_verified"] = False
+        signal["stale_entry_reason"] = intraday.get("reason") or "No verified live price was available; trade levels are disabled."
+        trade["entry"] = None
+        trade["stop"] = None
+        trade["target_1"] = None
+        trade["target_2"] = None
+        trade["risk_per_share"] = None
+        trade["reward_risk_to_target_2"] = None
+        trade["invalidates_below"] = None
+        trade["entry_basis"] = "PRICE_UNVERIFIED"
+        signal["trade_plan"] = trade
         return signal
 
     atr14 = safe_float(history.get("atr14"))
@@ -655,9 +778,10 @@ def apply_intraday_confirmation(signal: Dict[str, Any], intraday: Dict[str, Any]
 
     signal["intraday"] = intraday
     signal = recalculate_trade_plan_from_live_price(signal, intraday)
+    signal["price_verified"] = intraday.get("price_verified") is True
     signal["intraday_confirmed"] = intraday.get("intraday_confirmed")
     signal["entry_status"] = intraday.get("entry_status")
-    signal["action"] = "eligible_for_bullish_calls" if intraday.get("intraday_confirmed") else "watchlist_only"
+    signal["action"] = "PRICE_UNVERIFIED" if intraday.get("price_verified") is not True else ("eligible_for_bullish_calls" if intraday.get("intraday_confirmed") else "watchlist_only")
     signal["historical_score"] = round(original_score, 1)
 
     intraday_quality = calculate_intraday_quality_score(intraday, signal)
@@ -1697,6 +1821,22 @@ def health() -> Dict[str, Any]:
         "tracking_file": str(TRACKED_SIGNALS_FILE),
         "tracking_records": len(load_tracked_signals()) if TRACKED_SIGNALS_FILE.exists() else 0,
     }
+
+
+class LiveQuoteRequest(BaseModel):
+    tickers: List[str] = Field(..., min_length=1, description="Tickers to validate with uncached Polygon live endpoints")
+
+
+@app.post("/live_quotes")
+async def live_quotes(req: LiveQuoteRequest) -> Dict[str, Any]:
+    tickers = sorted({normalize_ticker(t) for t in req.tickers if normalize_ticker(t)})
+    timeout = httpx.Timeout(connect=LIVE_QUOTE_TIMEOUT_SECONDS, read=LIVE_QUOTE_TIMEOUT_SECONDS, write=LIVE_QUOTE_TIMEOUT_SECONDS, pool=LIVE_QUOTE_TIMEOUT_SECONDS)
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        results = await asyncio.gather(*(fetch_intraday_snapshot(client, ticker) for ticker in tickers), return_exceptions=True)
+    rows = []
+    for ticker, result in zip(tickers, results):
+        rows.append({"ticker": ticker, "price_verified": False, "error": str(result)} if isinstance(result, Exception) else result)
+    return {"generated_at_utc": datetime.now(timezone.utc).isoformat(), "market_session_phase": market_session_phase(), "results": rows}
 
 
 @app.get("/universe_members")
